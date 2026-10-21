@@ -90,6 +90,7 @@ scripts/selftest.sh --no-screen  # skip the cases that need Screen Recording
 scripts/soak.sh 1800             # 30-minute 4K60 soak with CPU/memory sampling and ffprobe checks
 scripts/synccheck.py FILE        # A/V offset of a flash + beep recording
 scripts/levelcheck.py FILE --expect 0,-12,mute,0  # beep levels of a test-pattern recording
+python3 -m doctest scripts/levelcheck.py           # the level checker's own tests
 ```
 
 Test recordings go to `~/Movies/rec-rs-tests/`.

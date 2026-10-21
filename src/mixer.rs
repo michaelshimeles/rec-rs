@@ -254,23 +254,29 @@ impl Volume {
     }
 }
 
-/// Longest a gain change takes to complete.
+/// How long a gain change takes to complete.
 const RAMP_SECS: f32 = 0.02;
 
-/// Applies a source's gain. A new gain is reached over at most RAMP_SECS
-/// instead of at once, so moving a fader or muting never clicks.
+/// Applies a source's gain. A new gain is reached over RAMP_SECS instead
+/// of at once, so moving a fader or muting never clicks.
 pub struct Fader {
     gain: f32,
     target: f32,
+    /// Size of the change in progress, which sets its pace for every
+    /// buffer it spans.
+    span: f32,
 }
 
 impl Fader {
     pub fn new(gain: f32) -> Self {
-        Fader { gain, target: gain }
+        Fader { gain, target: gain, span: 0.0 }
     }
 
     pub fn set(&mut self, gain: f32) {
-        self.target = gain;
+        if gain != self.target {
+            self.target = gain;
+            self.span = (gain - self.gain).abs();
+        }
     }
 
     /// The gain for each of the next `n` frames at `rate`, or None while it
@@ -279,11 +285,13 @@ impl Fader {
         if self.gain == 1.0 && self.target == 1.0 {
             return None;
         }
-        let step = self.gain.max(self.target).max(1.0) / (RAMP_SECS * rate.max(1.0) as f32);
+        // A floor so that a tiny change still lands.
+        let step = (self.span / (RAMP_SECS * rate.max(1.0) as f32)).max(1e-5);
         Some(
             (0..n)
                 .map(|_| {
-                    self.gain += (self.target - self.gain).clamp(-step, step);
+                    let d = self.target - self.gain;
+                    self.gain = if d.abs() <= step { self.target } else { self.gain + step.copysign(d) };
                     self.gain
                 })
                 .collect(),
@@ -650,6 +658,15 @@ mod tests {
         f.set(boost);
         let e = f.envelope(1920, RATE).unwrap();
         assert!(e[950] < boost && e[961..].iter().all(|g| *g == boost));
+        // Muting a boosted source in device-sized buffers still takes 20 ms.
+        let mut g = vec![];
+        f.set(0.0);
+        for _ in 0..4 {
+            g.extend(f.envelope(480, RATE).unwrap());
+        }
+        assert!(g[950] > 0.0 && g[961..].iter().all(|g| *g == 0.0), "{} {}", g[959], g[961]);
+        f.set(boost);
+        f.envelope(960, RATE);
         // Back to unity: once there, the audio passes through again.
         f.set(1.0);
         assert_eq!(*f.envelope(960, 16000.0).unwrap().last().unwrap(), 1.0);
