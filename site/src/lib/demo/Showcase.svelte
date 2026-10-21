@@ -1,18 +1,10 @@
 <script lang="ts">
-	import type { Attachment } from 'svelte/attachments';
 	import { span } from '#lib/ease.js';
 	import Scene from './Scene.svelte';
 	import type { Player } from './player.svelte.js';
 	import { CHAPTERS, DURATION, STAGE } from './script.js';
 
 	let { player }: { player: Player } = $props();
-	let scale = $state(1);
-
-	const fit: Attachment<HTMLElement> = (node) => {
-		const observer = new ResizeObserver(() => (scale = node.clientWidth / STAGE.w));
-		observer.observe(node);
-		return () => observer.disconnect();
-	};
 
 	const chapters = CHAPTERS.map((c, i) => ({ ...c, end: CHAPTERS[i + 1]?.t ?? DURATION }));
 </script>
@@ -22,10 +14,9 @@
 		class="frame"
 		role="img"
 		aria-label="Demo of the Rec window: picking a slides window as the source, turning on the camera overlay and dragging it to a corner, starting a recording with Shift-Command-R, pausing and resuming, then stopping and revealing one file with a video track and three audio tracks."
-		{@attach fit}
 		{@attach player.observe}
 	>
-		<div class="stage" style:transform="scale({scale})">
+		<div class="stage" style:--width="{STAGE.w}px">
 			<Scene t={player.time} />
 		</div>
 		{#if !player.sound}
@@ -110,6 +101,7 @@
 		max-width: 1200px;
 		aspect-ratio: 30 / 19;
 		overflow: hidden;
+		container-type: inline-size;
 		border-radius: 16px;
 		background: #0c0b14;
 		box-shadow:
@@ -128,6 +120,8 @@
 		top: 0;
 		left: 0;
 		transform-origin: 0 0;
+		/* tan(atan2(a, b)) is a / b. It fits the scene in CSS, before and without any script. */
+		transform: scale(tan(atan2(100cqw, var(--width))));
 	}
 
 	.listen {
