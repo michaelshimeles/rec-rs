@@ -174,6 +174,8 @@ pub struct State {
     pub refresh_devices: bool,
     /// Overlay last sent to the running session.
     pip_applied: Option<crate::compose::PipSpec>,
+    /// Audio levels last sent to the running session.
+    volumes_applied: Option<[crate::mixer::Volume; 2]>,
     /// Camera aspect ratio from the running session (for drag hit-testing).
     pub cam_aspect: f64,
     pub permissions_missing: bool,
@@ -256,6 +258,20 @@ impl State {
         if self.pip_applied.as_ref() != Some(&spec) {
             sess.set_pip(spec.clone());
             self.pip_applied = Some(spec);
+        }
+    }
+
+    /// Send the fader levels to the running session if they changed: the
+    /// preview's meters, the file and the live encode follow at once.
+    pub fn apply_volumes(&mut self) {
+        let Some(sess) = self.recording.as_ref().or(self.preview.as_ref()) else {
+            self.volumes_applied = None;
+            return;
+        };
+        let v = self.settings.volumes();
+        if self.volumes_applied != Some(v) {
+            sess.set_volumes(v);
+            self.volumes_applied = Some(v);
         }
     }
 
@@ -352,6 +368,7 @@ impl App {
             refresh_devices: false,
             permissions_missing: false,
             pip_applied: None,
+            volumes_applied: None,
             cam_aspect: 16.0 / 9.0,
             live: crate::live::Live::new(),
             replay_stats: None,
@@ -540,10 +557,17 @@ impl App {
             settings.display = 1;
             eprintln!("rec: warning: {}", warning.as_deref().unwrap_or_default());
         }
-        let args = settings.record_args(output);
+        let mut args = settings.record_args(output);
+        // REC_TEST_PATTERN: the CLI's synthetic source, for self-tests that
+        // need no privacy grants.
+        if std::env::var_os("REC_TEST_PATTERN").is_some() {
+            args.push("--test-pattern".into());
+        }
         let refs: Vec<&str> = args.iter().map(String::as_str).collect();
         let (mut o, t) = crate::prepare(crate::parse_record_args(&refs)?)?;
         o.live = Some(self.st.live.clone());
+        // With the mutes, which the CLI doesn't take.
+        o.volumes = settings.volumes();
         // Fallbacks never block: say so once.
         let warning = [warning, o.mic_warning.clone()].into_iter().flatten().collect::<Vec<_>>().join(" · ");
         let warning = Some(warning).filter(|w| !w.is_empty());
@@ -678,6 +702,7 @@ impl App {
             match self.options(None).and_then(|(o, t)| Session::start_with_camera(&o, t, false, Some(cb), cam)) {
                 Ok(s) => {
                     self.st.pip_applied = Some(self.st.settings.pip_spec());
+                    self.st.volumes_applied = Some(self.st.settings.volumes());
                     self.st.preview = Some(s);
                     self.st.permissions_missing = false;
                 }
@@ -729,6 +754,7 @@ impl App {
             Ok(sess) => {
                 let _ = std::fs::write(record::pidfile_path(), format!("{}\n{}\n", std::process::id(), file.display()));
                 self.st.pip_applied = Some(self.st.settings.pip_spec());
+                self.st.volumes_applied = Some(self.st.settings.volumes());
                 self.st.recording = Some(sess);
                 record::PAUSE_REQ.store(false, Ordering::SeqCst);
                 record::RESUME_REQ.store(false, Ordering::SeqCst);
@@ -901,6 +927,7 @@ impl App {
         }
         self.sync_preview();
         self.st.apply_pip();
+        self.st.apply_volumes();
         let clock = self.st.clock();
         let view = menubar::View {
             recording: self.st.recording.is_some(),
@@ -1236,6 +1263,51 @@ impl SelfTest {
                     }
                     push(Cmd::Quit);
                     self.step = 6;
+                }
+                _ => {}
+            }
+            return;
+        }
+        // REC_GUI_SELFTEST=levels (with REC_TEST_PATTERN, whose beeps are the
+        // system audio): move the system fader while recording, from 0 dB to
+        // -12 dB, muted, then 0 dB again, and save the replay buffer.
+        // scripts/levelcheck.py checks that both files follow the fader.
+        if std::env::var("REC_GUI_SELFTEST").as_deref() == Ok("levels") {
+            let s = &mut app.st.settings;
+            let mut set = |db: f32, muted: bool| {
+                (s.system_gain_db, s.system_muted) = (db, muted);
+                println!("selftest: system fader {db} dB muted={muted} t={t:.2}");
+            };
+            match self.step {
+                0 if t > 2.0 => {
+                    push(Cmd::ToggleRecording);
+                    self.step = 1;
+                }
+                1 if t > 4.5 => {
+                    set(-12.0, false);
+                    self.step = 2;
+                }
+                2 if t > 6.5 => {
+                    set(-12.0, true);
+                    self.step = 3;
+                }
+                3 if t > 8.5 => {
+                    set(0.0, false);
+                    self.step = 4;
+                }
+                4 if t > 10.5 => {
+                    push(Cmd::ToggleRecording);
+                    self.step = 5;
+                }
+                5 if !app.st.finishing && app.st.recording.is_none() => {
+                    println!("selftest: saved={:?} error={:?}", app.st.last_file, app.st.error);
+                    push(Cmd::SaveReplay);
+                    self.step = 6;
+                }
+                6 if app.st.notice.is_some() || app.st.error.is_some() || t > 25.0 => {
+                    println!("selftest: replay saved={:?} error={:?}", app.st.last_file, app.st.error);
+                    push(Cmd::Quit);
+                    self.step = 7;
                 }
                 _ => {}
             }

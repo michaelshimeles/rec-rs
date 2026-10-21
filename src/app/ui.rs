@@ -8,6 +8,7 @@ use super::theme::{self, BODY, SECONDARY, TOOLBAR_H, TRAFFIC_LIGHTS_W};
 use super::widgets::{self as w, Icon};
 use super::{Cmd, Meter, State, Stream};
 use crate::compose::{self, Corner, Place, Scene, Shape};
+use crate::mixer::{MAX_DB, MIN_DB};
 use crate::settings::{FPS, RESOLUTIONS};
 use crate::settings::{Settings, StreamDest};
 use crate::writer::{AudioLayout, Codec};
@@ -105,7 +106,7 @@ pub fn main_window(ui: &mut Ui, st: &mut State) {
             });
         });
     egui::Panel::bottom("controls")
-        .exact_size(68.0)
+        .exact_size(84.0)
         .frame(egui::Frame::NONE.fill(p.window).inner_margin(Margin::symmetric(16, 10)))
         .show(ui, |ui| controls(ui, st));
     egui::Panel::right("sources")
@@ -417,11 +418,21 @@ fn controls(ui: &mut Ui, st: &mut State) {
         let color = if paused { p.secondary } else if recording { RED } else { p.tertiary };
         ui.label(RichText::new(clock).font(egui::FontId::monospace(22.0)).color(color));
         ui.add_space(16.0);
+        // The audio mixer: room is left for the buttons on the right.
+        let width = (ui.available_width() - 210.0).clamp(250.0, 480.0);
+        let mut s = st.settings.clone();
         ui.vertical(|ui| {
-            ui.add_space(4.0);
-            meter(ui, "System", st.meters[0], st.settings.system_audio);
-            meter(ui, "Mic", st.meters[1], st.settings.mic_enabled);
+            ui.spacing_mut().item_spacing.y = 4.0;
+            channel(ui, "System", st.meters[0], s.system_audio, &mut s.system_gain_db, &mut s.system_muted, width);
+            channel(ui, "Mic", st.meters[1], s.mic_enabled, &mut s.mic_gain_db, &mut s.mic_muted, width);
         });
+        if s != st.settings {
+            st.settings = s;
+            // At once, not on the next tick: the meters and the file follow
+            // the fader while it moves.
+            st.apply_volumes();
+            let _ = st.settings.save();
+        }
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             if ui.button("Open Folder").clicked() {
                 st.cmds.push(Cmd::OpenFolder);
@@ -433,42 +444,90 @@ fn controls(ui: &mut Ui, st: &mut State) {
     });
 }
 
-/// Horizontal peak meter, -60..0 dBFS, green/yellow/red with a peak tick.
-fn meter(ui: &mut Ui, label: &str, m: Meter, on: bool) {
+/// One channel of the audio mixer: the source's name, mute, a level meter
+/// over its fader, and the level in dB (click to type one).
+/// Changes apply live, also while recording.
+fn channel(ui: &mut Ui, label: &str, m: Meter, on: bool, db: &mut f32, muted: &mut bool, width: f32) {
+    const LABEL_W: f32 = 44.0;
+    const VALUE_W: f32 = 62.0;
     let p = theme::pal(ui);
     ui.horizontal(|ui| {
-        ui.add_sized(vec2(44.0, 14.0), egui::Label::new(RichText::new(label).size(SECONDARY).color(p.secondary)));
-        let (rect, _) = ui.allocate_exact_size(vec2(220.0, 8.0), Sense::hover());
-        let painter = ui.painter();
-        painter.rect_filled(rect, CornerRadius::same(3), p.control);
-        if !on {
-            painter.text(rect.center(), egui::Align2::CENTER_CENTER, "off", egui::FontId::proportional(9.0), p.tertiary);
-            return;
-        }
-        let frac = |db: f32| ((db + 60.0) / 60.0).clamp(0.0, 1.0);
-        let x = |f: f32| rect.left() + rect.width() * f;
-        let level = frac(m.db);
-        for (lo, hi, col) in [
-            (0.0, frac(-18.0), Color32::from_rgb(0x34, 0xc7, 0x59)),
-            (frac(-18.0), frac(-6.0), Color32::from_rgb(0xff, 0xcc, 0x00)),
-            (frac(-6.0), 1.0, RED),
-        ] {
-            let hi = hi.min(level);
-            if hi > lo {
-                let r = egui::Rect::from_x_y_ranges(x(lo)..=x(hi), rect.y_range());
-                painter.rect_filled(r, CornerRadius::same(2), col);
+        ui.spacing_mut().item_spacing.x = 6.0;
+        w::slot(ui, LABEL_W, Align::Min, RichText::new(label).size(SECONDARY).color(p.secondary));
+        let tip = if *muted { format!("Unmute {label}") } else { format!("Mute {label}") };
+        w::mute_button(ui, muted, on).on_hover_text(tip);
+        let bar = (width - LABEL_W - 22.0 - VALUE_W - 3.0 * 6.0).max(80.0);
+        ui.vertical(|ui| {
+            ui.spacing_mut().item_spacing.y = 1.0;
+            meter(ui, m, on, *muted, bar);
+            w::fader(ui, db, bar, on, !*muted)
+                .on_hover_text(format!("{label} level: drag, scroll for fine steps, double-click for 0 dB"));
+        });
+        ui.allocate_ui_with_layout(vec2(VALUE_W, 22.0), Layout::right_to_left(Align::Center), |ui| {
+            if !on {
+                ui.label(RichText::new("Off").size(SECONDARY).color(p.tertiary));
+                return;
             }
-        }
-        if m.peak_db > -60.0 {
-            let px = x(frac(m.peak_db));
-            painter.vline(px, rect.y_range(), Stroke::new(2.0, p.text));
-        }
-        ui.label(
-            RichText::new(if m.db <= -89.0 { "-∞".to_string() } else { format!("{:.0}", m.db) })
-                .size(SECONDARY)
-                .color(p.secondary),
-        );
+            ui.spacing_mut().interact_size.x = VALUE_W;
+            ui.spacing_mut().button_padding.x = 4.0;
+            let value = egui::DragValue::new(db)
+                .range(MIN_DB..=MAX_DB)
+                .speed(0.1)
+                .custom_formatter(|v, _| db_text(v as f32))
+                .custom_parser(parse_db);
+            ui.add(value).on_hover_text("Level in dB: click to type, drag to adjust");
+        });
     });
+}
+
+/// A fader level: "-6.0 dB", "+3.0 dB", "-∞ dB" at the bottom.
+fn db_text(db: f32) -> String {
+    match db {
+        d if d <= MIN_DB => "-∞ dB".into(),
+        d if d.abs() < 0.05 => "0.0 dB".into(),
+        d => format!("{d:+.1} dB"),
+    }
+}
+
+/// A typed level: "-6", "-6 dB", "+3.5", or "-inf" / "-∞" / "off" for
+/// silence (the range clamps the rest).
+fn parse_db(text: &str) -> Option<f64> {
+    let t = text.trim().to_lowercase().replace('−', "-");
+    match t.trim_end_matches("db").trim() {
+        "-inf" | "-∞" | "off" => Some(MIN_DB as f64),
+        t => t.parse().ok(),
+    }
+}
+
+/// Horizontal peak meter, -60..0 dBFS, green/yellow/red with a peak tick;
+/// grey while the source is muted (it still shows the level).
+fn meter(ui: &mut Ui, m: Meter, on: bool, muted: bool, width: f32) {
+    let p = theme::pal(ui);
+    let (rect, _) = ui.allocate_exact_size(vec2(width, 6.0), Sense::hover());
+    let painter = ui.painter();
+    painter.rect_filled(rect, CornerRadius::same(2), p.control);
+    if !on {
+        return;
+    }
+    let frac = |db: f32| ((db + 60.0) / 60.0).clamp(0.0, 1.0);
+    let x = |f: f32| rect.left() + rect.width() * f;
+    let level = frac(m.db);
+    let zones = if muted {
+        [p.tertiary; 3]
+    } else {
+        [Color32::from_rgb(0x34, 0xc7, 0x59), Color32::from_rgb(0xff, 0xcc, 0x00), RED]
+    };
+    for (lo, hi, col) in [(0.0, frac(-18.0), zones[0]), (frac(-18.0), frac(-6.0), zones[1]), (frac(-6.0), 1.0, zones[2])] {
+        let hi = hi.min(level);
+        if hi > lo {
+            let r = egui::Rect::from_x_y_ranges(x(lo)..=x(hi), rect.y_range());
+            painter.rect_filled(r, CornerRadius::same(2), col);
+        }
+    }
+    if m.peak_db > -60.0 {
+        let px = x(frac(m.peak_db));
+        painter.vline(px, rect.y_range(), Stroke::new(2.0, if muted { p.secondary } else { p.text }));
+    }
 }
 
 /// Mic choices; a saved mic that isn't connected stays listed as such.
@@ -908,11 +967,8 @@ fn settings_form(ui: &mut Ui, st: &mut State) {
         ];
         combo(ui, "tracks", &mut s.audio_tracks, &opts, true);
         ui.end_row();
-        ui.label("System gain");
-        ui.add(egui::Slider::new(&mut s.system_gain_db, -24.0..=12.0).suffix(" dB").step_by(0.5));
-        ui.end_row();
-        ui.label("Mic gain");
-        ui.add(egui::Slider::new(&mut s.mic_gain_db, -24.0..=24.0).suffix(" dB").step_by(0.5));
+        ui.label("Levels");
+        ui.label(RichText::new("Set with the faders under the preview, also while recording.").size(SECONDARY).color(theme::pal(ui).secondary));
         ui.end_row();
     });
 
@@ -985,5 +1041,27 @@ fn settings_form(ui: &mut Ui, st: &mut State) {
     if s != st.settings {
         st.settings = s;
         let _ = st.settings.save();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn levels_as_text_and_typed() {
+        assert_eq!(db_text(MIN_DB), "-∞ dB");
+        assert_eq!(db_text(-6.04), "-6.0 dB");
+        assert_eq!(db_text(0.01), "0.0 dB");
+        assert_eq!(db_text(3.5), "+3.5 dB");
+        for (typed, db) in [("-6", -6.0), ("-6 dB", -6.0), ("−6.5dB", -6.5), ("+3", 3.0), ("4.0 db", 4.0), ("-inf", MIN_DB as f64), ("-∞ dB", MIN_DB as f64), ("Off", MIN_DB as f64)] {
+            assert_eq!(parse_db(typed), Some(db), "{typed}");
+        }
+        assert_eq!(parse_db("loud"), None);
+        assert_eq!(parse_db("inf"), Some(f64::INFINITY), "the top of the fader, once clamped");
+        // What the field shows parses back.
+        for db in [MIN_DB, -6.0, 0.0, 3.5] {
+            assert_eq!(parse_db(&db_text(db)), Some(db as f64));
+        }
     }
 }

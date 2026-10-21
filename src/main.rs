@@ -241,10 +241,12 @@ pub struct RecordArgs {
     /// Live audio bitrate in kb/s (AAC; Opus for WHIP).
     #[arg(long, default_value_t = 192)]
     audio_bitrate: u32,
-    /// System audio gain in the mix track (dB).
+    /// System audio level in dB, in every track and the stream (-60 or
+    /// lower is silence, at most +24).
     #[arg(long, default_value_t = 0.0, allow_hyphen_values = true)]
     system_gain: f32,
-    /// Microphone gain in the mix track (dB).
+    /// Microphone level in dB, in every track and the stream (-60 or lower
+    /// is silence, at most +24).
     #[arg(long, default_value_t = 0.0, allow_hyphen_values = true)]
     mic_gain: f32,
     /// Microphone capture backend.
@@ -427,7 +429,7 @@ pub fn prepare(a: RecordArgs) -> Result<(record::Options, Option<screen::Target>
         quiet: a.quiet,
         test_pattern: a.test_pattern.then_some(a.noise),
         audio_layout: a.audio_tracks,
-        gains_db: [a.system_gain, a.mic_gain],
+        volumes: [a.system_gain, a.mic_gain].map(|db| mixer::Volume { db, muted: false }),
         mic_backend: if a.test_pattern { record::MicBackend::Avcapture } else { a.mic_backend },
         scene,
         system_offset_ms: a.system_audio_offset_ms,

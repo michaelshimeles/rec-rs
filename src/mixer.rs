@@ -27,7 +27,6 @@ pub struct Mixer {
     buf: VecDeque<[f32; 2]>,
     horizon: [Option<i64>; 2],
     active: [bool; 2],
-    gain: [f32; 2],
     fmt: CFRetained<CMAudioFormatDescription>,
     /// Samples that would have clipped (the limiter held them back).
     pub clipped: u64,
@@ -44,8 +43,83 @@ fn idx(k: AudioKind) -> usize {
     }
 }
 
-/// Decode a PCM sample buffer to (pts seconds, sample rate, stereo frames).
-pub fn decode(sb: &CMSampleBuffer) -> Option<(f64, f64, Vec<[f32; 2]>)> {
+/// LPCM sample encodings.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Sample {
+    F32,
+    F64,
+    I16,
+    I24,
+    I32,
+    /// Read as silence, never written.
+    Other,
+}
+
+impl Sample {
+    fn of(asbd: &AudioStreamBasicDescription) -> Sample {
+        match (asbd.mFormatFlags & kAudioFormatFlagIsFloat != 0, asbd.mBitsPerChannel) {
+            (true, 32) => Sample::F32,
+            (true, 64) => Sample::F64,
+            (false, 16) => Sample::I16,
+            (false, 24) => Sample::I24,
+            (false, 32) => Sample::I32,
+            _ => Sample::Other,
+        }
+    }
+
+    fn size(self) -> usize {
+        match self {
+            Sample::F64 => 8,
+            Sample::F32 | Sample::I32 => 4,
+            Sample::I24 => 3,
+            Sample::I16 => 2,
+            Sample::Other => 0,
+        }
+    }
+
+    /// # Safety
+    /// `p` points at `self.size()` readable bytes.
+    unsafe fn read(self, p: *const u8) -> f32 {
+        unsafe {
+            match self {
+                Sample::F32 => (p as *const f32).read_unaligned(),
+                Sample::F64 => (p as *const f64).read_unaligned() as f32,
+                Sample::I16 => (p as *const i16).read_unaligned() as f32 / 32768.0,
+                Sample::I32 => (p as *const i32).read_unaligned() as f32 / 2147483648.0,
+                Sample::I24 => {
+                    let v = ((*p as i32) | ((*p.add(1) as i32) << 8) | ((*p.add(2) as i32) << 16)) << 8 >> 8;
+                    v as f32 / 8388608.0
+                }
+                Sample::Other => 0.0,
+            }
+        }
+    }
+
+    /// Samples saturate at full scale (a boosted source's own track has
+    /// no limiter).
+    /// # Safety
+    /// `p` points at `self.size()` writable bytes.
+    unsafe fn write(self, p: *mut u8, v: f32) {
+        let int = |full: f64| (v as f64 * full).round().clamp(-full, full - 1.0) as i32;
+        unsafe {
+            match self {
+                Sample::F32 => (p as *mut f32).write_unaligned(v.clamp(-1.0, 1.0)),
+                Sample::F64 => (p as *mut f64).write_unaligned(v.clamp(-1.0, 1.0) as f64),
+                Sample::I16 => (p as *mut i16).write_unaligned(int(32768.0) as i16),
+                Sample::I32 => (p as *mut i32).write_unaligned(int(2147483648.0)),
+                Sample::I24 => {
+                    let b = int(8388608.0).to_le_bytes();
+                    std::ptr::copy_nonoverlapping(b.as_ptr(), p, 3);
+                }
+                Sample::Other => {}
+            }
+        }
+    }
+}
+
+/// Run `f` on a PCM sample buffer's format, audio buffers and frame count
+/// (None for compressed or empty buffers).
+fn with_pcm<R>(sb: &CMSampleBuffer, f: impl FnOnce(&AudioStreamBasicDescription, &[AudioBuffer], usize) -> R) -> Option<R> {
     unsafe {
         let fd = sb.format_description()?;
         let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(&fd).as_ref()?;
@@ -79,38 +153,141 @@ pub fn decode(sb: &CMSampleBuffer) -> Option<(f64, f64, Vec<[f32; 2]>)> {
         let _block = NonNull::new(block).map(|b| CFRetained::from_raw(b));
         let nbuf = (*abl).mNumberBuffers as usize;
         let bufs = std::slice::from_raw_parts((*abl).mBuffers.as_ptr(), nbuf);
-        let is_float = asbd.mFormatFlags & kAudioFormatFlagIsFloat != 0;
-        let non_inter = asbd.mFormatFlags & kAudioFormatFlagIsNonInterleaved != 0;
-        let bits = asbd.mBitsPerChannel;
-        let ch = asbd.mChannelsPerFrame.max(1) as usize;
+        if bufs.iter().any(|b| b.mData.is_null()) {
+            return None;
+        }
+        Some(f(asbd, bufs, frames))
+    }
+}
+
+/// Channels interleaved in each audio buffer.
+fn channels_per_buffer(asbd: &AudioStreamBasicDescription) -> usize {
+    if asbd.mFormatFlags & kAudioFormatFlagIsNonInterleaved != 0 { 1 } else { asbd.mChannelsPerFrame.max(1) as usize }
+}
+
+/// Decode a PCM sample buffer to (pts seconds, sample rate, stereo frames).
+pub fn decode(sb: &CMSampleBuffer) -> Option<(f64, f64, Vec<[f32; 2]>)> {
+    let pts = secs(unsafe { sb.presentation_time_stamp() });
+    with_pcm(sb, |asbd, bufs, frames| {
+        let fmt = Sample::of(asbd);
+        let ch = channels_per_buffer(asbd);
         let read = |b: &AudioBuffer, i: usize| -> f32 {
-            match (is_float, bits) {
-                (true, 32) => *(b.mData as *const f32).add(i),
-                (true, 64) => *(b.mData as *const f64).add(i) as f32,
-                (false, 16) => *(b.mData as *const i16).add(i) as f32 / 32768.0,
-                (false, 32) => *(b.mData as *const i32).add(i) as f32 / 2147483648.0,
-                (false, 24) => {
-                    let p = (b.mData as *const u8).add(i * 3);
-                    let v = ((*p as i32) | ((*p.add(1) as i32) << 8) | ((*p.add(2) as i32) << 16)) << 8 >> 8;
-                    v as f32 / 8388608.0
-                }
-                _ => 0.0,
+            if (i + 1) * fmt.size() > b.mDataByteSize as usize {
+                return 0.0;
             }
+            unsafe { fmt.read((b.mData as *const u8).add(i * fmt.size())) }
         };
         let mut out = Vec::with_capacity(frames);
         for f in 0..frames {
-            let (l, r) = if non_inter {
+            let (l, r) = if ch == 1 {
                 let l = read(&bufs[0], f);
-                let r = if nbuf > 1 { read(&bufs[1], f) } else { l };
+                let r = if bufs.len() > 1 { read(&bufs[1], f) } else { l };
                 (l, r)
             } else {
-                let l = read(&bufs[0], f * ch);
-                let r = if ch > 1 { read(&bufs[0], f * ch + 1) } else { l };
-                (l, r)
+                (read(&bufs[0], f * ch), read(&bufs[0], f * ch + 1))
             };
             out.push([l, r]);
         }
-        Some((secs(sb.presentation_time_stamp()), asbd.mSampleRate, out))
+        (pts, asbd.mSampleRate, out)
+    })
+}
+
+/// Copy of a PCM sample buffer, in its own format and with its timestamp,
+/// with frame `k` multiplied by `env[k]` (samples saturate at full scale).
+/// None for formats it can't write.
+pub fn scaled(sb: &CMSampleBuffer, env: &[f32]) -> Option<CFRetained<CMSampleBuffer>> {
+    let (fd, pts) = unsafe { (sb.format_description()?, sb.presentation_time_stamp()) };
+    let (data, frames) = with_pcm(sb, |asbd, bufs, frames| {
+        let fmt = Sample::of(asbd);
+        if fmt == Sample::Other {
+            return None;
+        }
+        let ch = channels_per_buffer(asbd);
+        // The buffers end to end: how a block buffer holds non-interleaved
+        // channels.
+        let mut data: Vec<u8> = Vec::new();
+        for b in bufs {
+            let start = data.len();
+            data.extend_from_slice(unsafe { std::slice::from_raw_parts(b.mData as *const u8, b.mDataByteSize as usize) });
+            let buf = &mut data[start..];
+            for (f, g) in env.iter().enumerate().take(frames) {
+                for c in 0..ch {
+                    let at = (f * ch + c) * fmt.size();
+                    if at + fmt.size() <= buf.len() {
+                        unsafe {
+                            let p = buf.as_mut_ptr().add(at);
+                            fmt.write(p, fmt.read(p) * g);
+                        }
+                    }
+                }
+            }
+        }
+        Some((data, frames))
+    })??;
+    let fd: &CMAudioFormatDescription = unsafe { &*(&*fd as *const CMFormatDescription as *const CMAudioFormatDescription) };
+    sample_buffer(fd, &data, frames, pts)
+}
+
+/// Fader travel in dB. The bottom is silence (shown as -inf), the top a
+/// boost for quiet sources.
+pub const MIN_DB: f32 = -60.0;
+pub const MAX_DB: f32 = 24.0;
+
+/// A source's level as set on its fader: gain in dB, and mute.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Volume {
+    pub db: f32,
+    pub muted: bool,
+}
+
+impl Volume {
+    pub const UNITY: Volume = Volume { db: 0.0, muted: false };
+
+    /// Linear gain of the fader alone: silence at or below MIN_DB.
+    pub fn fader_gain(self) -> f32 {
+        if self.db > MIN_DB { 10f32.powf(self.db.min(MAX_DB) / 20.0) } else { 0.0 }
+    }
+
+    /// Linear gain applied to the source's audio.
+    pub fn gain(self) -> f32 {
+        if self.muted { 0.0 } else { self.fader_gain() }
+    }
+}
+
+/// Longest a gain change takes to complete.
+const RAMP_SECS: f32 = 0.02;
+
+/// Applies a source's gain. A new gain is reached over at most RAMP_SECS
+/// instead of at once, so moving a fader or muting never clicks.
+pub struct Fader {
+    gain: f32,
+    target: f32,
+}
+
+impl Fader {
+    pub fn new(gain: f32) -> Self {
+        Fader { gain, target: gain }
+    }
+
+    pub fn set(&mut self, gain: f32) {
+        self.target = gain;
+    }
+
+    /// The gain for each of the next `n` frames at `rate`, or None while it
+    /// is unity (the audio passes through untouched).
+    pub fn envelope(&mut self, n: usize, rate: f64) -> Option<Vec<f32>> {
+        if self.gain == 1.0 && self.target == 1.0 {
+            return None;
+        }
+        let step = self.gain.max(self.target).max(1.0) / (RAMP_SECS * rate.max(1.0) as f32);
+        Some(
+            (0..n)
+                .map(|_| {
+                    self.gain += (self.target - self.gain).clamp(-step, step);
+                    self.gain
+                })
+                .collect(),
+        )
     }
 }
 
@@ -235,14 +412,13 @@ fn soft_clip(s: f32) -> f32 {
 }
 
 impl Mixer {
-    pub fn new(t0_secs: f64, system: bool, mic: bool, gain_db: [f32; 2]) -> Self {
+    pub fn new(t0_secs: f64, system: bool, mic: bool) -> Self {
         Mixer {
             t0: (t0_secs * RATE).round() as i64,
             base: 0,
             buf: VecDeque::new(),
             horizon: [None, None],
             active: [system, mic],
-            gain: gain_db.map(|db| 10f32.powf(db / 20.0)),
             fmt: stereo_format(),
             clipped: 0,
             resamplers: [None, None],
@@ -272,15 +448,14 @@ impl Mixer {
         if self.buf.len() < need {
             self.buf.resize(need, [0.0, 0.0]);
         }
-        let g = self.gain[i];
         for (n, fr) in frames.iter().enumerate() {
             let pos = start + n as i64 - self.base;
             if pos < 0 {
                 continue; // already emitted
             }
             let slot = &mut self.buf[pos as usize];
-            slot[0] += fr[0] * g;
-            slot[1] += fr[1] * g;
+            slot[0] += fr[0];
+            slot[1] += fr[1];
         }
     }
 
@@ -315,7 +490,7 @@ impl Mixer {
 
 /// 48 kHz interleaved stereo f32 PCM.
 pub fn stereo_format() -> CFRetained<CMAudioFormatDescription> {
-    let asbd = AudioStreamBasicDescription {
+    audio_format(&AudioStreamBasicDescription {
         mSampleRate: RATE,
         mFormatID: kAudioFormatLinearPCM,
         mFormatFlags: kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked,
@@ -325,12 +500,15 @@ pub fn stereo_format() -> CFRetained<CMAudioFormatDescription> {
         mChannelsPerFrame: 2,
         mBitsPerChannel: 32,
         mReserved: 0,
-    };
+    })
+}
+
+fn audio_format(asbd: &AudioStreamBasicDescription) -> CFRetained<CMAudioFormatDescription> {
     let mut fd: *const CMAudioFormatDescription = std::ptr::null();
     unsafe {
         CMAudioFormatDescriptionCreate(
             None,
-            NonNull::from(&asbd),
+            NonNull::from(asbd),
             0,
             std::ptr::null(),
             0,
@@ -344,14 +522,15 @@ pub fn stereo_format() -> CFRetained<CMAudioFormatDescription> {
 
 /// Wrap interleaved stereo samples (`stereo_format`) starting at `pts` in a
 /// sample buffer.
-pub fn pcm_buffer(
-    fmt: &CMAudioFormatDescription,
-    mut data: Vec<f32>,
-    pts: CMTime,
-) -> Option<CFRetained<CMSampleBuffer>> {
-    let n = data.len() / 2;
+pub fn pcm_buffer(fmt: &CMAudioFormatDescription, data: Vec<f32>, pts: CMTime) -> Option<CFRetained<CMSampleBuffer>> {
+    let bytes = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4) };
+    sample_buffer(fmt, bytes, data.len() / 2, pts)
+}
+
+/// `frames` of PCM in `fmt`, copied from `data`, starting at `pts`.
+fn sample_buffer(fmt: &CMAudioFormatDescription, data: &[u8], frames: usize, pts: CMTime) -> Option<CFRetained<CMSampleBuffer>> {
+    let bytes = data.len();
     unsafe {
-        let bytes = data.len() * 4;
         let mut block: *mut CMBlockBuffer = std::ptr::null_mut();
         if CMBlockBuffer::create_with_memory_block(
             None,
@@ -368,13 +547,13 @@ pub fn pcm_buffer(
             return None;
         }
         let block = CFRetained::from_raw(NonNull::new(block)?);
-        CMBlockBuffer::replace_data_bytes(NonNull::new(data.as_mut_ptr() as *mut _)?, &block, 0, bytes);
+        CMBlockBuffer::replace_data_bytes(NonNull::new(data.as_ptr() as *mut _)?, &block, 0, bytes);
         let mut out: *mut CMSampleBuffer = std::ptr::null_mut();
         if CMAudioSampleBufferCreateReadyWithPacketDescriptions(
             None,
             &block,
             fmt,
-            n as isize,
+            frames as isize,
             pts,
             std::ptr::null(),
             NonNull::from(&mut out),
@@ -404,7 +583,7 @@ mod tests {
 
     #[test]
     fn sums_sources_on_a_shared_timeline() {
-        let mut m = Mixer::new(10.0, true, true, [0.0, 0.0]);
+        let mut m = Mixer::new(10.0, true, true);
         m.push(AudioKind::System, 10.0, RATE, vec![[0.25, 0.25]; 480]);
         // Nothing until the mic reaches the same point (it may still arrive).
         assert!(m.pull(false).is_none());
@@ -422,30 +601,112 @@ mod tests {
     }
 
     #[test]
-    fn gain_and_limiting() {
-        // +6 dB: 0.2 -> 0.399, untouched (under the ceiling).
-        let mut m = Mixer::new(0.0, false, true, [0.0, 6.0]);
-        m.push(AudioKind::Mic, 0.0, RATE, vec![[0.2, -0.3]; 100]);
+    fn limiting() {
+        // Under the ceiling: untouched.
+        let mut m = Mixer::new(0.0, false, true);
+        m.push(AudioKind::Mic, 0.0, RATE, vec![[0.4, -0.6]; 100]);
         let (_, out) = pull_all(&mut m, true);
-        assert!((out[50][0] - 0.399).abs() < 0.01);
-        assert!((out[50][1] + 0.599).abs() < 0.01);
+        assert_eq!(out[50], [0.4, -0.6]);
         assert_eq!(m.clipped, 0);
-        // Too loud: held under full scale (both channels by the same gain,
-        // so the stereo image keeps), never flattened at 1.0.
-        let mut m = Mixer::new(0.0, false, true, [0.0, 6.0]);
-        m.push(AudioKind::Mic, 0.0, RATE, vec![[0.4, -0.6]; 4800]);
+        // Too loud (a source boosted on its fader): held under full scale
+        // (both channels by the same gain, so the stereo image keeps), never
+        // flattened at 1.0.
+        let mut m = Mixer::new(0.0, false, true);
+        m.push(AudioKind::Mic, 0.0, RATE, vec![[0.8, -1.2]; 4800]);
         let (_, out) = pull_all(&mut m, true);
         assert!(out.iter().all(|f| f[0].abs() < 1.0 && f[1].abs() < 1.0));
         let last = out[4799];
         assert!((last[1].abs() - CEILING).abs() < 0.01, "{last:?}");
-        assert!((last[0] / last[1] + 0.4 / 0.6).abs() < 0.01);
+        assert!((last[0] / last[1] + 0.8 / 1.2).abs() < 0.01);
         assert_eq!(m.clipped, 4800);
+    }
+
+    #[test]
+    fn volume_gain() {
+        let v = |db, muted| Volume { db, muted };
+        assert_eq!(Volume::UNITY.gain(), 1.0);
+        assert!((v(-6.0, false).gain() - 0.501).abs() < 0.001);
+        assert!((v(12.0, false).gain() - 3.981).abs() < 0.001);
+        assert_eq!(v(MAX_DB + 20.0, false).gain(), v(MAX_DB, false).gain(), "boost is capped");
+        assert_eq!(v(MIN_DB, false).gain(), 0.0, "the bottom of the fader is silence");
+        assert_eq!(v(f32::NEG_INFINITY, false).gain(), 0.0);
+        assert_eq!(v(f32::NAN, false).gain(), 0.0);
+        assert_eq!(v(0.0, true).gain(), 0.0);
+        assert_eq!(v(-6.0, true).fader_gain(), v(-6.0, false).gain(), "the meter still sees a muted source");
+    }
+
+    #[test]
+    fn fader_glides_and_passes_unity_through() {
+        let mut f = Fader::new(1.0);
+        assert!(f.envelope(480, RATE).is_none(), "unity: untouched");
+        // Mute: down to silence within 20 ms, never a jump.
+        f.set(0.0);
+        let e = f.envelope(1920, RATE).unwrap();
+        assert!(e.windows(2).all(|w| w[1] <= w[0] && w[0] - w[1] < 0.0011), "smooth");
+        assert!(e[0] > 0.99 && e[950] > 0.0);
+        assert!(e[961..].iter().all(|g| *g == 0.0));
+        // A boost glides as fast, whatever its size, and settles exactly.
+        let boost = Volume { db: 24.0, muted: false }.gain();
+        f.set(boost);
+        let e = f.envelope(1920, RATE).unwrap();
+        assert!(e[950] < boost && e[961..].iter().all(|g| *g == boost));
+        // Back to unity: once there, the audio passes through again.
+        f.set(1.0);
+        assert_eq!(*f.envelope(960, 16000.0).unwrap().last().unwrap(), 1.0);
+        assert!(f.envelope(480, RATE).is_none());
+    }
+
+    /// A sample buffer in an arbitrary PCM layout, for `scaled`.
+    fn buffer(flags: u32, bits: u32, channels: u32, data: &[u8], frames: usize) -> CFRetained<CMSampleBuffer> {
+        let non_inter = flags & kAudioFormatFlagIsNonInterleaved != 0;
+        let bytes = bits / 8 * if non_inter { 1 } else { channels };
+        let fmt = audio_format(&AudioStreamBasicDescription {
+            mSampleRate: RATE,
+            mFormatID: kAudioFormatLinearPCM,
+            mFormatFlags: flags | kAudioFormatFlagIsPacked,
+            mBytesPerPacket: bytes,
+            mFramesPerPacket: 1,
+            mBytesPerFrame: bytes,
+            mChannelsPerFrame: channels,
+            mBitsPerChannel: bits,
+            mReserved: 0,
+        });
+        let pts = unsafe { CMTime::new(48000 * 7, 48000) };
+        sample_buffer(&fmt, data, frames, pts).unwrap()
+    }
+
+    #[test]
+    fn scales_in_the_buffers_own_format() {
+        let env = [0.5, 0.25, 2.0, 0.0];
+        // Float stereo, interleaved.
+        let f: Vec<f32> = vec![0.2, -0.4, 0.2, -0.4, 0.6, -0.6, 0.2, -0.4];
+        let sb = buffer(kAudioFormatFlagIsFloat, 32, 2, &f.iter().flat_map(|v| v.to_ne_bytes()).collect::<Vec<_>>(), 4);
+        let out = scaled(&sb, &env).unwrap();
+        let (pts, rate, frames) = decode(&out).unwrap();
+        assert_eq!((pts, rate), (7.0, RATE), "same timing");
+        assert_eq!(frames, vec![[0.1, -0.2], [0.05, -0.1], [1.0, -1.0], [0.0, 0.0]], "saturates");
+        // Float stereo, one buffer per channel.
+        let f: Vec<f32> = vec![0.2, 0.2, 0.2, 0.2, -0.4, -0.4, -0.4, -0.4];
+        let flags = kAudioFormatFlagIsFloat | kAudioFormatFlagIsNonInterleaved;
+        let sb = buffer(flags, 32, 2, &f.iter().flat_map(|v| v.to_ne_bytes()).collect::<Vec<_>>(), 4);
+        let (_, _, frames) = decode(&scaled(&sb, &env).unwrap()).unwrap();
+        assert_eq!(frames, vec![[0.1, -0.2], [0.05, -0.1], [0.4, -0.8], [0.0, 0.0]]);
+        // 16-bit mono: saturates instead of wrapping.
+        let i: Vec<i16> = vec![16384, -16384, 30000, 1000];
+        let sb = buffer(kAudioFormatFlagIsSignedInteger, 16, 1, &i.iter().flat_map(|v| v.to_ne_bytes()).collect::<Vec<_>>(), 4);
+        let (_, _, frames) = decode(&scaled(&sb, &env).unwrap()).unwrap();
+        assert_eq!(frames.iter().map(|f| f[0]).collect::<Vec<_>>(), vec![0.25, -0.125, 32767.0 / 32768.0, 0.0]);
+        // 24-bit packed mono.
+        let i: Vec<u8> = [4194304i32, -4194304, 4194304, 4194304].iter().flat_map(|v| v.to_le_bytes()[..3].to_vec()).collect();
+        let sb = buffer(kAudioFormatFlagIsSignedInteger, 24, 1, &i, 4);
+        let (_, _, frames) = decode(&scaled(&sb, &env).unwrap()).unwrap();
+        assert_eq!(frames.iter().map(|f| f[0]).collect::<Vec<_>>(), vec![0.25, -0.125, 8388607.0 / 8388608.0, 0.0]);
     }
 
     /// A sine through the resampler in uneven buffers: the right length and
     /// pitch, seamless across buffers (error against the ideal 48 kHz sine).
     fn resampled_sine_error(from: f64, freq: f64, chunk: usize) -> (usize, f64) {
-        let mut m = Mixer::new(0.0, false, true, [0.0, 0.0]);
+        let mut m = Mixer::new(0.0, false, true);
         let n = from as usize; // 1 s
         let sine = |t: f64| (2.0 * std::f64::consts::PI * freq * t).sin() as f32 * 0.5;
         let mut i = 0;
@@ -479,7 +740,7 @@ mod tests {
     fn resampler_removes_content_above_nyquist() {
         // 20 kHz at 96 kHz cannot pass to 48 kHz unaliased, but is under
         // 24 kHz; 30 kHz must be filtered out rather than fold to 18 kHz.
-        let mut m = Mixer::new(0.0, false, true, [0.0, 0.0]);
+        let mut m = Mixer::new(0.0, false, true);
         let frames: Vec<[f32; 2]> = (0..96000)
             .map(|k| { let v = (2.0 * std::f64::consts::PI * 30000.0 * k as f64 / 96000.0).sin() as f32 * 0.5; [v, v] })
             .collect();
@@ -491,7 +752,7 @@ mod tests {
 
     #[test]
     fn small_jitter_snaps_to_continuous() {
-        let mut m = Mixer::new(0.0, true, false, [0.0, 0.0]);
+        let mut m = Mixer::new(0.0, true, false);
         m.push(AudioKind::System, 0.0, RATE, vec![[0.1, 0.1]; 480]);
         // 1 ms late: within SNAP, so no gap of silence is inserted.
         m.push(AudioKind::System, 0.011, RATE, vec![[0.1, 0.1]; 480]);

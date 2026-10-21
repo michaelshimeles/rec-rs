@@ -89,6 +89,7 @@ scripts/selftest.sh              # records through every pipeline and verifies e
 scripts/selftest.sh --no-screen  # skip the cases that need Screen Recording
 scripts/soak.sh 1800             # 30-minute 4K60 soak with CPU/memory sampling and ffprobe checks
 scripts/synccheck.py FILE        # A/V offset of a flash + beep recording
+scripts/levelcheck.py FILE --expect 0,-12,mute,0  # beep levels of a test-pattern recording
 ```
 
 Test recordings go to `~/Movies/rec-rs-tests/`.
@@ -143,8 +144,15 @@ The **main window** contains:
   - Camera.
   - Microphone.
   - System audio.
-- **Record / Stop** (⇧⌘R from anywhere), **Pause / Resume**, the recording timer, and **level
-  meters** for system audio and mic with peak hold.
+- **Record / Stop** (⇧⌘R from anywhere), **Pause / Resume** and the recording timer.
+- **Audio mixer**: for system audio and the mic, a level meter with peak hold above a fader,
+  a mute button and the level in dB.
+  - The fader runs from −∞ to +24 dB, with 0 dB marked. Drag it, click the track to jump,
+    scroll for fine steps, double-click for 0 dB, or click the value and type one.
+  - Changes apply at once, also while recording, to every track of the file and to the replay
+    buffer and streams.
+  - The meters show the level after the fader. A muted source's meter turns grey and keeps
+    moving, so you can see the mic still hears you.
 - **Reveal Last** and **Open Folder**.
 - **Replay buffer**: keep the last 15–300 s (default 60) in memory, shown with its memory use.
   **Save Replay** or **⇧⌘S** from anywhere writes it to an MP4 in the output folder without
@@ -174,7 +182,7 @@ The **settings window** (⌘, or the Settings… button) covers:
   or window (4K of a 16:10 display is 3456x2160): no black bars, nothing cropped.
 - Frame rate, codec (auto, H.264, HEVC, ProRes) and bitrate.
 - Cursor and click highlighting.
-- Audio devices, track layout and gains.
+- Audio devices and track layout. Levels are set with the faders in the main window.
 - Camera device, plus the overlay: shape, roundness, size, border, shadow, corner presets and
   mirroring.
 - Live encode for the replay buffer and streams: resolution, video bitrate, CBR, keyframe
@@ -241,7 +249,7 @@ frames, and pauses don't count.
 | `--pip-pos X,Y` | | Center the overlay anywhere, as fractions of the frame from the top-left (overrides `--pip-corner`). |
 | `--pip-roundness`, `--pip-border`, `--pip-border-color`, `--pip-shadow` | `0.2`, `0`, `ffffff`, off | Roundness 0–1; border width in pixels at 1080p; hex color; soft drop shadow. |
 | `--audio-tracks` | `both` | `both` = mix plus system and mic stems; `mix`; `stems`. |
-| `--system-gain`, `--mic-gain` | `0` | dB, in the mix track. |
+| `--system-gain`, `--mic-gain` | `0` | Level in dB on every track and the stream. −60 or lower is silence, and +24 is the top. |
 | `--system-audio-offset-ms`, `--mic-offset-ms` | output latency, `0` | Sync offsets. System audio is shifted by the output device's latency by default (see Output format). |
 | `--no-cursor`, `--clicks` | cursor shown | |
 | `-t, --duration` | | Seconds of output. |
@@ -323,6 +331,10 @@ rec-rs record --no-record --stream rtmp://localhost/live --stream http://localho
 - **Single clock.** Screen, system audio, mic and webcam are all stamped on the host clock, and
   audio is never stretched. The flash/beep sync test measures 0.0 ms between video and audio in
   the file, including across pauses.
+- **Levels.** Each source's fader and mute apply before anything else uses its audio, so the
+  mix, the source's own track and the live encode get the same level. A change takes at most
+  20 ms to complete, so moving a fader or muting doesn't click. At 0 dB a source's own track
+  keeps the device's samples untouched.
 - **System audio latency.** ScreenCaptureKit captures system audio when it is mixed, which is
   one output latency before you hear it. rec-rs shifts it later by the output device's latency,
   read from CoreAudio (about 27 ms on built-in speakers, more on Bluetooth), so the audio lines
@@ -361,7 +373,7 @@ rec-rs record --no-record --stream rtmp://localhost/live --stream http://localho
 | Microphone | ✅ | ✅ |
 | Webcam overlay | ✅ any layout | ✅ drag anywhere with corner snapping; circle, rounded, square, pill or squircle; roundness, border, shadow, mirror; live while recording |
 | Separate audio tracks | ✅ up to 6 | ✅ mix plus system and mic stems |
-| Per-source gain | ✅ | ✅ |
+| Per-source gain | ✅ | ✅ live faders from −∞ to +24 dB and mute, also while recording |
 | Audio filters (noise suppression, compressor) | ✅ | ❌ |
 | Hardware H.264 / HEVC | ✅ | ✅ |
 | ProRes | ✅ | ✅ 422 |
@@ -373,7 +385,7 @@ rec-rs record --no-record --stream rtmp://localhost/live --stream http://localho
 | Streaming | ✅ RTMP, WHIP, SRT, multitrack | ✅ RTMP/RTMPS (YouTube, Twitch, Kick, custom) and WHIP, any number at once from one encode and one Go Live, H.264 or HEVC Main10 (enhanced RTMP), platform bitrate presets up to 4K60, auto-reconnect, live status; key in the Keychain |
 | Screen scaling | GPU bilinear/bicubic/Lanczos | ✅ native capture, Metal Lanczos per plane (5K→4K VMAF 100 vs 90 for ScreenCaptureKit) |
 | Live preview | ✅ | ✅ |
-| Level meters | ✅ | ✅ peak with hold |
+| Level meters | ✅ | ✅ peak with hold, after the fader |
 | Global hotkey | ✅ configurable | ✅ ⇧⌘R record, ⇧⌘S save replay (fixed) |
 | Menu bar control | ❌ | ✅ menu bar item plus Dock app |
 | Headless CLI | ❌ (obs-cli via websocket) | ✅ `rec-rs record …`, `stop`, `pause`, `resume` |
@@ -415,13 +427,13 @@ rec-rs record --no-record --stream rtmp://localhost/live --stream http://localho
 | `src/screen.rs` | ScreenCaptureKit capture, displays and windows |
 | `src/camera.rs` | Webcam and AVCapture mic, device lists |
 | `src/compose.rs` | CoreImage scenes and webcam overlay |
-| `src/mixer.rs` | Real-time audio mixer |
+| `src/mixer.rs` | Real-time audio mixer, faders (level, mute, gain ramps) |
 | `src/live/` | Shared live encode (VideoToolbox H.264, AAC/Opus), replay buffer, RTMP/RTMPS and WHIP outputs, Keychain |
 | `src/tcc.rs` | Permissions and responsibility disclaim |
 | `src/probe.rs` | AVFoundation verification |
 | `src/synth.rs` | Test pattern with flash + beep |
 | `src/scale.rs` | Native-resolution screen scaling (Metal Performance Shaders Lanczos, VideoToolbox fallback) |
-| `scripts/` | Build, self-test, soak, sync checks (`synccheck.py` with ffmpeg, `avsync.swift` with AVFoundation) and quality metrics (`quality.sh`, `encquality.sh`, `testcard.swift`) |
+| `scripts/` | Build, self-test, soak, sync checks (`synccheck.py` with ffmpeg, `avsync.swift` with AVFoundation), level checks (`levelcheck.py`) and quality metrics (`quality.sh`, `encquality.sh`, `testcard.swift`) |
 | `site/` | Download page: SvelteKit, deployed to Vercel (see [site/README.md](site/README.md)) |
 | `AGENTS.md`, `.agents/skills/` | Agent workflow, checks and skills from [michaelshimeles/skills](https://github.com/michaelshimeles/skills); `.claude/skills/` links to the same skills |
 | `analysis/OBS_ARCHITECTURE.md` | OBS study |

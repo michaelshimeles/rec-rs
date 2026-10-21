@@ -52,6 +52,27 @@ if scripts/synccheck.py "$OUT/pause.mov" --max-ms 1 >"$OUT/pause.check" 2>&1 \
 else
   echo "FAIL  pause-resume  (see $OUT/pause.check)"; fail=$((fail+1))
 fi
+# Levels: --system-gain reaches the system audio's own track (here the only
+# one). In the app, the system fader moves while recording (0 dB, -12 dB,
+# muted, 0 dB) and the file and the replay buffer follow it.
+if "$REC" record -q --test-pattern --no-mic --system-gain=-12 -t 3 -o "$OUT/gain.mov" >/dev/null 2>"$OUT/gain.log" \
+   && scripts/levelcheck.py "$OUT/gain.mov" --ref=-6 --expect=-12 >"$OUT/gain.check" 2>&1; then
+  echo "PASS  gain  (--system-gain -12 on the system audio track)"; pass=$((pass+1))
+else
+  echo "FAIL  gain  (see $OUT/gain.check)"; fail=$((fail+1))
+fi
+mkdir -p "$OUT/guilevels"
+echo '{"scene": "screen", "mic_enabled": false, "replay_enabled": true, "replay_secs": 30}' >"$OUT/guilevels/settings.json"
+if REC_GUI_SELFTEST=levels REC_TEST_PATTERN=1 REC_GUI_BACKGROUND=1 REC_OUTPUT_DIR="$OUT/guilevels" \
+     REC_SETTINGS="$OUT/guilevels/settings.json" "$REC" gui >"$OUT/guilevels.log" 2>&1 \
+   && f=$(sed -n 's/.*selftest: saved=Some("\(.*\)").*/\1/p' "$OUT/guilevels.log") && [ -n "$f" ] \
+   && r=$(sed -n 's/.*replay saved=Some("\(.*\)") error.*/\1/p' "$OUT/guilevels.log") && [ -n "$r" ] \
+   && scripts/levelcheck.py "$f" --expect 0,-12,mute,0 >"$OUT/guilevels.check" 2>&1 \
+   && scripts/levelcheck.py "$r" --tail --expect 0,-12,mute,0 >>"$OUT/guilevels.check" 2>&1; then
+  echo "PASS  gui-levels  (fader moved while recording: file and replay at 0, -12 dB, muted, 0)"; pass=$((pass+1))
+else
+  echo "FAIL  gui-levels  (see $OUT/guilevels.log, $OUT/guilevels.check)"; fail=$((fail+1))
+fi
 # Replay buffer: no file recorded, `rec-rs save-replay` mid-run writes the
 # last seconds to an MP4 that is in sync.
 mkdir -p "$OUT/replay"
@@ -127,6 +148,16 @@ elif [ "${1:-}" != "--no-screen" ]; then
   check screen-1080-all   -t 3
   check screen-4k-webcam  -r 4k --webcam -t 3
   check screen-mix.mp4    -t 2 --audio-tracks mix
+  # The faders on real devices, in their own sample formats: the file plays,
+  # and the mic at the bottom of its fader leaves its track (the third) silent.
+  if "$REC" record -q -t 2 --system-gain=-12 --mic-gain=-60 -o "$OUT/screen-levels.mov" >/dev/null 2>"$OUT/screen-levels.log" \
+     && "$REC" probe "$OUT/screen-levels.mov" >"$OUT/screen-levels.probe" 2>&1 \
+     && [ "$(grep -c '^track' "$OUT/screen-levels.probe")" = 4 ] \
+     && scripts/levelcheck.py "$OUT/screen-levels.mov" --audio 2 --expect mute >"$OUT/screen-levels.check" 2>&1; then
+    echo "PASS  screen-levels  (system -12 dB, mic at the bottom of its fader: mic track silent)"; pass=$((pass+1))
+  else
+    echo "FAIL  screen-levels  (see $OUT/screen-levels.log, .probe, .check)"; fail=$((fail+1))
+  fi
   # App: scripted preview -> record (the hotkey's command) -> pause/resume
   # -> stop -> settings window -> hide window -> quit.
   mkdir -p "$OUT/gui"; echo '{"scene": "screen-cam"}' >"$OUT/gui/settings.json"
