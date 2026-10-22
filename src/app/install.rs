@@ -86,34 +86,46 @@ fn applications_dir() -> Result<PathBuf> {
 }
 
 /// Copy `bundle` into `apps` under its own name, without the quarantine flag (with it, macOS
-/// would translocate the copy as well). An older copy there is handed to `discard` first.
-/// Returns the new bundle's path.
+/// would translocate the copy as well). An older copy there is swapped out and handed to
+/// `discard`; if that fails, it is swapped back. Returns the new bundle's path.
 pub fn install(bundle: &Path, apps: &Path, discard: impl Fn(&Path) -> Result<()>) -> Result<PathBuf> {
     let name = bundle.file_name().context("the app has no file name")?;
     let dest = apps.join(name);
-    // Staged under a name of this process's own: another copy may be moving itself at the same
-    // time. Whichever renames second fails and leaves the other's complete copy in place.
-    let mut tmp_name = OsString::from(".");
-    tmp_name.push(name);
-    tmp_name.push(format!(".moving-{}", std::process::id()));
-    let tmp = apps.join(tmp_name);
-    let _ = std::fs::remove_dir_all(&tmp);
+    // Staged in a folder of this process's own (another copy may be moving itself at the same
+    // time), under the app's name, which an old copy swapped out keeps in the Trash.
+    let mut stage_name = OsString::from(".");
+    stage_name.push(name);
+    stage_name.push(format!(".moving-{}", std::process::id()));
+    let stage = apps.join(stage_name);
+    let tmp = stage.join(name);
+    let _ = std::fs::remove_dir_all(&stage);
     let copied = Command::new("/usr/bin/ditto").arg(bundle).arg(&tmp).status().context("could not run ditto")?;
     let placed = (|| {
         if !copied.success() {
             bail!("could not copy {} into {}", bundle.display(), apps.display());
         }
         strip_quarantine(&tmp)?;
-        if std::fs::symlink_metadata(&dest).is_ok() {
-            discard(&dest).with_context(|| format!("could not replace {}", dest.display()))?;
+        // The destination is never missing, even for a moment: another copy may be opening it.
+        match rename(&tmp, &dest, libc::RENAME_EXCL) {
+            Err(e) if e.raw_os_error() == Some(libc::EEXIST) => {
+                rename(&tmp, &dest, libc::RENAME_SWAP).with_context(|| format!("could not replace {}", dest.display()))?;
+                if let Err(e) = discard(&tmp) {
+                    let _ = rename(&tmp, &dest, libc::RENAME_SWAP);
+                    return Err(e.context(format!("could not replace {}", dest.display())));
+                }
+                Ok(())
+            }
+            r => r.with_context(|| format!("could not move the copy to {}", dest.display())),
         }
-        std::fs::rename(&tmp, &dest).with_context(|| format!("could not move the copy to {}", dest.display()))
     })();
-    if let Err(e) = placed {
-        let _ = std::fs::remove_dir_all(&tmp);
-        return Err(e);
-    }
-    Ok(dest)
+    let _ = std::fs::remove_dir_all(&stage);
+    placed.map(|()| dest)
+}
+
+/// rename(2) with RENAME_EXCL (fail if `to` exists) or RENAME_SWAP (exchange the two).
+fn rename(from: &Path, to: &Path, flags: libc::c_uint) -> std::io::Result<()> {
+    let (f, t) = (CString::new(from.as_os_str().as_bytes())?, CString::new(to.as_os_str().as_bytes())?);
+    if unsafe { libc::renamex_np(f.as_ptr(), t.as_ptr(), flags) } == 0 { Ok(()) } else { Err(std::io::Error::last_os_error()) }
 }
 
 fn strip_quarantine(p: &Path) -> Result<()> {
@@ -439,6 +451,32 @@ mod tests {
         let original = std::fs::canonicalize(d.join("real/Applications/Rec.app")).unwrap();
         let apps = d.join("link/Applications");
         assert_eq!(plan(Some(&original), &apps, |_| true), Plan::Clear(original.clone()));
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn never_leaves_the_destination_missing() {
+        // Another copy may be opening the destination at any moment: the new copy goes in by an
+        // atomic swap, and only then does the old one go, under its own name.
+        let d = temp_dir("swap");
+        let (src, apps) = (d.join("Downloads"), d.join("Applications"));
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::create_dir_all(&apps).unwrap();
+        fake_bundle(&apps, "old");
+        let app = fake_bundle(&src, "new");
+        let dest = apps.join("Rec.app");
+        let seen = std::cell::RefCell::new(vec![]);
+        install(&app, &apps, |old| {
+            seen.borrow_mut().push((
+                std::fs::read_to_string(dest.join("Contents/MacOS/rec-rs")).unwrap_or_default(),
+                std::fs::read_to_string(old.join("Contents/MacOS/rec-rs")).unwrap_or_default(),
+                old.file_name().unwrap().to_owned(),
+            ));
+            Ok(std::fs::remove_dir_all(old)?)
+        })
+        .unwrap();
+        assert_eq!(*seen.borrow(), [("new".to_string(), "old".to_string(), OsString::from("Rec.app"))]);
+        assert_eq!(std::fs::read_dir(&apps).unwrap().count(), 1, "no copy left behind");
         std::fs::remove_dir_all(&d).unwrap();
     }
 
