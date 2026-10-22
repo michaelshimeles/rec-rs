@@ -91,9 +91,11 @@ fn applications_dir() -> Result<PathBuf> {
 pub fn install(bundle: &Path, apps: &Path, discard: impl Fn(&Path) -> Result<()>) -> Result<PathBuf> {
     let name = bundle.file_name().context("the app has no file name")?;
     let dest = apps.join(name);
+    // Staged under a name of this process's own: another copy may be moving itself at the same
+    // time. Whichever renames second fails and leaves the other's complete copy in place.
     let mut tmp_name = OsString::from(".");
     tmp_name.push(name);
-    tmp_name.push(".moving");
+    tmp_name.push(format!(".moving-{}", std::process::id()));
     let tmp = apps.join(tmp_name);
     let _ = std::fs::remove_dir_all(&tmp);
     let copied = Command::new("/usr/bin/ditto").arg(bundle).arg(&tmp).status().context("could not run ditto")?;
@@ -144,8 +146,7 @@ fn trash(p: &Path) -> Result<()> {
         .map_err(|e| anyhow::anyhow!("{}", e.localizedDescription()))
 }
 
-/// Open `app` once this process has exited: LaunchServices would only bring a running copy with
-/// the same bundle ID to the front. REC_* settings carry over (self-tests).
+/// Open `app` once this process has exited, as it was started.
 fn reopen(app: &Path) -> Result<()> {
     let mut pids = vec![std::process::id().to_string()];
     // Started from a shell, Rec re-runs itself as a child of the copy that was started
@@ -153,8 +154,19 @@ fn reopen(app: &Path) -> Result<()> {
     if std::env::var_os("REC_DISCLAIMED").is_some() {
         pids.push(unsafe { libc::getppid() }.to_string());
     }
-    let mut open: Vec<OsString> = vec![];
-    for (k, v) in std::env::vars_os() {
+    let background = std::env::var_os("REC_GUI_BACKGROUND").is_some();
+    let args = std::env::args_os().skip(1).filter(|a| !a.as_bytes().starts_with(b"-psn_")).collect();
+    let open = open_args(app, std::env::vars_os(), args, background);
+    let script = r#"for pid in $1; do while kill -0 "$pid" 2>/dev/null; do sleep 0.1; done; done; shift; exec /usr/bin/open "$@""#;
+    Command::new("/bin/sh").arg("-c").arg(script).arg("sh").arg(pids.join(" ")).args(open).spawn().context("could not reopen Rec")?;
+    Ok(())
+}
+
+/// `open` arguments that start a new instance of `app` (another copy of Rec may be running), with
+/// this one's command line (`gui --start-recording`, say) and REC_* settings (self-tests).
+fn open_args(app: &Path, env: impl IntoIterator<Item = (OsString, OsString)>, args: Vec<OsString>, background: bool) -> Vec<OsString> {
+    let mut open: Vec<OsString> = vec!["-n".into()];
+    for (k, v) in env {
         if k.as_bytes().starts_with(b"REC_") && k != "REC_DISCLAIMED" {
             let mut kv = k;
             kv.push("=");
@@ -162,13 +174,15 @@ fn reopen(app: &Path) -> Result<()> {
             open.extend(["--env".into(), kv]);
         }
     }
-    if std::env::var_os("REC_GUI_BACKGROUND").is_some() {
+    if background {
         open.push("-g".into());
     }
     open.push(app.into());
-    let script = r#"for pid in $1; do while kill -0 "$pid" 2>/dev/null; do sleep 0.1; done; done; shift; exec /usr/bin/open "$@""#;
-    Command::new("/bin/sh").arg("-c").arg(script).arg("sh").arg(pids.join(" ")).args(open).spawn().context("could not reopen Rec")?;
-    Ok(())
+    if !args.is_empty() {
+        open.push("--args".into());
+        open.extend(args);
+    }
+    open
 }
 
 /// What makes a copy that needs moving updatable.
@@ -426,6 +440,30 @@ mod tests {
         let apps = d.join("link/Applications");
         assert_eq!(plan(Some(&original), &apps, |_| true), Plan::Clear(original.clone()));
         std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn stages_apart_from_other_copies() {
+        // Another running copy may be staging its own install in the same folder.
+        let d = temp_dir("staging");
+        let (src, apps) = (d.join("Downloads"), d.join("Applications"));
+        std::fs::create_dir_all(apps.join(".Rec.app.moving/Contents")).unwrap();
+        std::fs::create_dir_all(&src).unwrap();
+        let app = fake_bundle(&src, "new");
+        install(&app, &apps, |_| panic!("nothing to replace")).unwrap();
+        assert!(apps.join(".Rec.app.moving/Contents").is_dir(), "another copy's staging is left alone");
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn reopens_a_new_instance_with_the_same_options() {
+        let env = [("REC_SETTINGS", "/tmp/s.json"), ("REC_DISCLAIMED", "1"), ("HOME", "/Users/x")];
+        let args = ["gui", "--start-recording"];
+        let a = open_args(Path::new("/Applications/Rec.app"), env.map(|(k, v)| (k.into(), v.into())), args.map(Into::into).to_vec(), false);
+        let a: Vec<String> = a.iter().map(|s| s.to_string_lossy().into_owned()).collect();
+        assert_eq!(a, ["-n", "--env", "REC_SETTINGS=/tmp/s.json", "/Applications/Rec.app", "--args", "gui", "--start-recording"]);
+        let a = open_args(Path::new("/A/Rec.app"), vec![], vec![], true);
+        assert_eq!(a, ["-n", "-g", "/A/Rec.app"].map(OsString::from));
     }
 
     /// Run against a real translocated copy: REC_TRANSLOCATED=<its bundle path> cargo test --

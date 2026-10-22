@@ -76,16 +76,17 @@ fi
 # Opened where it can't update itself, the app makes itself updatable and reopens. macOS runs a
 # quarantined copy that was never moved in Finder from a read-only folder (App Translocation);
 # the flag 00c1 is a download the user already opened. A disk image is read-only. In an
-# Applications folder the app clears the flag in place; elsewhere it moves into Applications.
+# Applications folder the app clears the flag in place; elsewhere it moves into Applications. The
+# reopened copy keeps the command line it was started with.
 reopens() {
   name=$1; dir=$2; app=$3; plan=$4; shift 4
   open -W -g --stdout "$dir/first.log" --stderr "$dir/first.log" --env REC_GUI_SELFTEST=move --env REC_TEST_PATTERN=1 \
     --env REC_GUI_HIDDEN=1 --env REC_OUTPUT_DIR="$dir" --env REC_SETTINGS="$dir/settings.json" \
-    --env REC_MOVE_TO="$dir/Applications" "$app"
+    --env REC_MOVE_TO="$dir/Applications" "$app" --args gui --window 7
   i=0; while [ ! -f "$dir/relaunched.txt" ] && [ $i -lt 40 ]; do sleep 0.5; i=$((i+1)); done
   if grep -q "selftest: $plan" "$dir/first.log" \
      && grep -qx "exe=$dir/Applications/Rec.app/Contents/MacOS/rec-rs" "$dir/relaunched.txt" \
-     && grep -qx "needs_move=false" "$dir/relaunched.txt" \
+     && grep -qx "needs_move=false" "$dir/relaunched.txt" && grep -qx "args=gui --window 7" "$dir/relaunched.txt" \
      && ! xattr -p com.apple.quarantine "$dir/Applications/Rec.app" >/dev/null 2>&1 && "$@"; then
     echo "PASS  $name  ($plan, reopened from Applications without the quarantine flag)"; pass=$((pass+1))
   else

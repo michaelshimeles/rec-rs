@@ -1214,7 +1214,8 @@ impl SelfTest {
         if std::env::var("REC_GUI_SELFTEST").as_deref() == Ok("move") {
             if self.step == 0 && t > 1.0 {
                 let exe = std::env::current_exe().map(|p| p.display().to_string()).unwrap_or_default();
-                let report = format!("exe={exe}\nneeds_move={}\n", install::needs_move());
+                let args: Vec<String> = std::env::args().skip(1).collect();
+                let report = format!("exe={exe}\nneeds_move={}\nargs={}\n", install::needs_move(), args.join(" "));
                 let _ = std::fs::write(app.st.settings.output_dir.join("relaunched.txt"), report);
                 push(Cmd::Quit);
                 self.step = 1;
