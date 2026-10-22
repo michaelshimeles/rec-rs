@@ -81,6 +81,12 @@ the top of the script). Installed copies check that feed once a day through
 [Sparkle](https://sparkle-project.org) and offer to install a newer release; Rec › Check for
 Updates…, also in the menu bar item's menu, checks at once.
 
+Sparkle can't replace a copy on the disk image, or one that macOS runs from a temporary
+read-only folder. macOS does that to a downloaded app that was opened where it landed and never
+moved in Finder (App Translocation). Rec checks for both when it starts and offers to fix it:
+it clears the download's quarantine flag on a copy already in Applications, or moves itself
+there, and reopens. Until then Sparkle stays off, and Check for Updates… makes the same offer.
+
 Tests:
 
 ```sh
@@ -420,7 +426,7 @@ rec-rs record --no-record --stream rtmp://localhost/live --stream http://localho
 | Path | Contents |
 |---|---|
 | `src/main.rs` | CLI |
-| `src/app/` | App: windows and UI (`ui.rs`), menu bar item and app menu, Dock quit/reopen hooks, preview scaler, theme, macOS chrome |
+| `src/app/` | App: windows and UI (`ui.rs`), menu bar item and app menu, Dock quit/reopen hooks, preview scaler, theme, macOS chrome, Sparkle updates and moving into Applications (`install.rs`) |
 | `src/settings.rs` | Persisted settings → record arguments |
 | `src/hotkey.rs` | Global hotkey (Carbon `RegisterEventHotKey`; needs no Accessibility permission) |
 | `src/record.rs` | Sessions, pacing thread, signals, `stop`/`pause`/`resume` |

@@ -8,6 +8,7 @@
 //! preview and recording sessions and while the window is closed.
 
 mod dock;
+mod install;
 mod macos;
 mod menubar;
 mod preview;
@@ -830,7 +831,14 @@ impl App {
             Cmd::OpenFolder => macos::open_folder(&self.st.settings.output_dir),
             Cmd::SaveReplay => self.save_replay(),
             Cmd::ToggleStream => self.toggle_stream(),
+            // Sparkle can't update a copy that needs moving: offer the move instead.
+            Cmd::StartUpdater if install::needs_move() => {}
             Cmd::StartUpdater => updater::start(),
+            Cmd::CheckForUpdates if install::needs_move() => {
+                if install::offer_move() {
+                    self.quit(el);
+                }
+            }
             Cmd::CheckForUpdates => updater::check_for_updates(),
             Cmd::Quit => self.quit(el),
         }
@@ -1047,6 +1055,11 @@ impl ApplicationHandler for App {
         if self.menubar.is_some() {
             return;
         }
+        // Opened where it was downloaded: move into Applications first, then reopen from there.
+        if install::needs_move() && install::offer_move() {
+            self.quit(el);
+            return;
+        }
         let mtm = objc2::MainThreadMarker::new().expect("main thread");
         let mb = menubar::MenuBar::new(mtm);
         let ok = crate::hotkey::register(HOTKEY_RECORD, crate::hotkey::KEY_R, crate::hotkey::CMD | crate::hotkey::SHIFT, || {
@@ -1195,6 +1208,19 @@ impl SelfTest {
         let t = self.t0.get_or_insert_with(Instant::now).elapsed().as_secs_f64();
         // REC_GUI_SELFTEST=terminate: quit the way the Dock does
         // (-[NSApp terminate:]) mid-recording; the file must be finalized.
+        // REC_GUI_SELFTEST=move: a copy started from a read-only volume moves itself to
+        // REC_MOVE_TO and reopens from there (install::offer_move). The reopened copy says
+        // where it runs, in relaunched.txt in the output folder, and quits.
+        if std::env::var("REC_GUI_SELFTEST").as_deref() == Ok("move") {
+            if self.step == 0 && t > 1.0 {
+                let exe = std::env::current_exe().map(|p| p.display().to_string()).unwrap_or_default();
+                let report = format!("exe={exe}\nneeds_move={}\n", install::needs_move());
+                let _ = std::fs::write(app.st.settings.output_dir.join("relaunched.txt"), report);
+                push(Cmd::Quit);
+                self.step = 1;
+            }
+            return;
+        }
         if std::env::var("REC_GUI_SELFTEST").as_deref() == Ok("terminate") {
             match self.step {
                 0 if t > 2.0 => {
