@@ -16,9 +16,9 @@
 	<string>APPL</string>
 	<!-- Both match the version in Cargo.toml; Sparkle compares CFBundleVersion with the feed's. -->
 	<key>CFBundleShortVersionString</key>
-	<string>0.1.1</string>
+	<string>0.1.2</string>
 	<key>CFBundleVersion</key>
-	<string>0.1.1</string>
+	<string>0.1.2</string>
 	<key>NSHumanReadableCopyright</key>
 	<string>Copyright © 2026 Michael Shimeles</string>
 	<key>LSAppNapIsDisabled</key>
