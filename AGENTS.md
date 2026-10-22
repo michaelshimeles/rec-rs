@@ -108,8 +108,10 @@ design and layout, and `site/README.md` covers the page.
   don't suggest that Rec is affiliated with the OBS Project.
 - Performance numbers, in the README or on the site, come from measurements
   recorded in `PERFORMANCE.md`.
-- The site stays one fast page with no analytics, tracking or third-party
-  requests. Its copy describes features the app ships today.
+- The site stays one fast page with no third-party requests in production.
+  Vercel Web Analytics is its only analytics. It sets no cookies, stores no
+  personal data and loads from the site's own `/_vercel/insights/` path. Add no
+  other tracking. The copy describes features the app ships today.
 - Don't deploy the site, create Vercel projects, or publish releases or tags
   unless Micky asks.
 
