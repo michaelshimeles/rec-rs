@@ -34,9 +34,10 @@ outside the synced checkout.
 - The page uses the system fonts (SF Pro and SF Mono on a Mac) and makes no third-party
   requests in production.
 - `src/routes/+layout.ts` adds Vercel Web Analytics, which counts page views without cookies
-  and stores no personal data. In production it loads its script from the site's own
-  `/_vercel/insights/` path. `npm run dev` loads a debug script from `va.vercel-scripts.com`
-  that logs page views to the console and sends nothing. The layout calls `inject()` from
-  `@vercel/analytics` because the package's SvelteKit helper imports `$app/stores`, which
-  throws in SvelteKit 3. The package's `@sveltejs/kit` peer range also stops at Kit 2, so
-  `package.json` overrides it to let a plain `npm install` succeed.
+  and stores no personal data. In production it loads its script and sends page views to a
+  per-project path on the site's own domain, which Vercel passes in at build time through the
+  `VITE_VERCEL_OBSERVABILITY_*` variables. `npm run dev` loads a debug script from
+  `va.vercel-scripts.com` that logs page views to the console and sends nothing. The layout
+  calls `inject()` from `@vercel/analytics` because the package's SvelteKit helper imports
+  `$app/stores`, which throws in SvelteKit 3. The package's `@sveltejs/kit` peer range also
+  stops at Kit 2, so `package.json` overrides it to let a plain `npm install` succeed.
