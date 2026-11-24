@@ -24,6 +24,7 @@ use objc2_core_video::{
 };
 use objc2_foundation::NSURL;
 
+use crate::bars::Bars;
 use crate::compose::{Compositor, Scene};
 use crate::mixer::{Fader, Mixer, Volume};
 use crate::util::*;
@@ -182,6 +183,8 @@ impl Pauses {
 }
 
 type Pb = SendBox<CFRetained<CVPixelBuffer>>;
+/// A camera frame and the black bars to crop off it.
+type CamFrame = (Pb, Bars);
 
 /// Receives every emitted (composited) video frame, throttled to ~30 fps.
 pub type PreviewFn = std::sync::Arc<dyn Fn(CFRetained<CVPixelBuffer>) + Send + Sync>;
@@ -247,8 +250,8 @@ pub struct Sink {
     live: Option<std::sync::Arc<crate::live::Live>>,
     screen_q: VecDeque<(f64, Pb)>,
     screen_last: Option<Pb>,
-    cam_q: VecDeque<(f64, Pb)>,
-    cam_last: Option<Pb>,
+    cam_q: VecDeque<(f64, CamFrame)>,
+    cam_last: Option<CamFrame>,
     compositor: Option<Compositor>,
     /// Scales native-size screen frames to the output size.
     scaler: Option<crate::scale::FrameScaler>,
@@ -583,7 +586,8 @@ impl Sink {
         Self::cap(&mut self.screen_q, &mut self.screen_last, QUEUE_MAX, due);
     }
 
-    pub fn push_cam(&mut self, pts: CMTime, pb: CFRetained<CVPixelBuffer>) {
+    /// A camera frame captured at `pts`, with the black bars to crop off it.
+    pub fn push_cam(&mut self, pts: CMTime, pb: CFRetained<CVPixelBuffer>, bars: Bars) {
         self.stats.cam_frames_in += 1;
         if let Some(g) = &mut self.cam_gate {
             let ready = *g.ready_at.get_or_insert(secs(pts) + g.settle);
@@ -599,7 +603,7 @@ impl Sink {
         self.stats.cam_latency_max = self.stats.cam_latency_max.max(lat);
         self.note_latency(1, lat, secs(pts));
         self.stats.cam_latency_sum += lat;
-        self.cam_q.push_back((secs(pts), SendBox(pb)));
+        self.cam_q.push_back((secs(pts), (SendBox(pb), bars)));
         let due = self.due_time();
         Self::cap(&mut self.cam_q, &mut self.cam_last, QUEUE_MAX, due);
     }
@@ -768,7 +772,7 @@ impl Sink {
     /// if it is due by the next slot: when emission runs behind, a newer
     /// frame must not be shown under an earlier timestamp (that put
     /// content up to several frames early); it is skipped instead.
-    fn cap(q: &mut VecDeque<(f64, Pb)>, last: &mut Option<Pb>, max: usize, due: f64) {
+    fn cap<T>(q: &mut VecDeque<(f64, T)>, last: &mut Option<T>, max: usize, due: f64) {
         while q.len() > max {
             let (pts, pb) = q.pop_front().unwrap();
             if pts <= due || last.is_none() {
@@ -778,7 +782,7 @@ impl Sink {
     }
 
     /// Pick the newest queued frame captured at or before `t`.
-    fn pick(q: &mut VecDeque<(f64, Pb)>, last: &mut Option<Pb>, t: f64) {
+    fn pick<T>(q: &mut VecDeque<(f64, T)>, last: &mut Option<T>, t: f64) {
         while let Some((pts, _)) = q.front() {
             if *pts <= t {
                 *last = q.pop_front().map(|x| x.1);
@@ -884,9 +888,10 @@ impl Sink {
                     }
                     continue;
                 };
-                let cam = self.cam_last.as_ref().map(|b| b.0.clone());
+                let cam = self.cam_last.as_ref().map(|(b, bars)| (b.0.clone(), *bars));
                 let scene = self.scene;
-                self.compositor.as_mut().unwrap().render(scene, screen.as_deref(), cam.as_deref(), &buf);
+                let cam = cam.as_ref().map(|(b, bars)| (&**b, *bars));
+                self.compositor.as_mut().unwrap().render(scene, screen.as_deref(), cam, &buf);
                 buf
             } else if self.scaled_pool.is_none()
                 && let Some(sc) = &self.scaler
@@ -1191,7 +1196,8 @@ mod tests {
                 let f = if std::env::var_os("PROBE_CAM").is_some() {
                     let out = crate::compose::color_probe::stripes(320, 64, &[0], None);
                     let pip = crate::compose::PipSpec { mirror: false, ..Default::default() };
-                    crate::compose::Compositor::new(320, 64, pip).render(crate::compose::Scene::Cam, None, Some(&src), &out);
+                    let cam = Some((&*src, super::Bars::NONE));
+                    crate::compose::Compositor::new(320, 64, pip).render(crate::compose::Scene::Cam, None, cam, &out);
                     let tf = out.attachment(kCVImageBufferTransferFunctionKey, std::ptr::null_mut());
                     println!("compositor output transfer tag: {:?}", tf);
                     out

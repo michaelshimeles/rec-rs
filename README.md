@@ -358,6 +358,11 @@ rec-rs record --no-record --stream rtmp://localhost/live --stream http://localho
 - **Camera.** In the app the running camera passes from the preview to the recording and
   back, so a recording starts with the exposure already settled. A camera started cold (CLI)
   is given 2 s to settle before the file starts, so it never opens on black or dark frames.
+  Rec picks the camera's format itself: landscape, 30 fps, 1280x720 when the camera has it.
+  Some cameras still send black bars around the picture (a DJI Osmo Pocket 3 can put its
+  16:9 picture in a portrait frame). Rec checks for bars twice a second and crops them once
+  they hold for 1.5 s, so the overlay has the picture's shape. Dark scenes don't count as
+  bars.
 - **Audio quality.** System audio and the mic are captured at 48 kHz; a device at another rate
   (44.1 kHz USB, 16/24 kHz Bluetooth) is resampled with a windowed-sinc filter that is
   continuous across buffers. The mix runs through a limiter that keeps it under −1 dBFS
@@ -432,7 +437,8 @@ rec-rs record --no-record --stream rtmp://localhost/live --stream http://localho
 | `src/record.rs` | Sessions, pacing thread, signals, `stop`/`pause`/`resume` |
 | `src/writer.rs` | AVAssetWriter sink, constant-frame-rate grid, pause timeline, track layout |
 | `src/screen.rs` | ScreenCaptureKit capture, displays and windows |
-| `src/camera.rs` | Webcam and AVCapture mic, device lists |
+| `src/camera.rs` | Webcam (and its format) and AVCapture mic, device lists |
+| `src/bars.rs` | Black bars around a camera's picture: measuring them and deciding when to crop |
 | `src/compose.rs` | CoreImage scenes and webcam overlay |
 | `src/mixer.rs` | Real-time audio mixer, faders (level, mute, gain ramps) |
 | `src/live/` | Shared live encode (VideoToolbox H.264, AAC/Opus), replay buffer, RTMP/RTMPS and WHIP outputs, Keychain |
