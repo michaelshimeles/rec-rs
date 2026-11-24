@@ -128,6 +128,9 @@ pub fn on_device_change(f: impl Fn() + Clone + 'static) {
 pub struct CamIvars {
     /// Where frames go; switched when the camera moves to another session.
     shared: std::sync::Mutex<Arc<Shared>>,
+    /// Black bars in the camera's frames. Kept with the camera, so a
+    /// session that takes it over crops from its first frame.
+    bars: std::sync::Mutex<crate::bars::Tracker>,
 }
 
 define_class!(
@@ -143,17 +146,28 @@ define_class!(
         unsafe fn did_output(&self, _o: &AVCaptureOutput, sb: &CMSampleBuffer, _c: &AVCaptureConnection) {
             unsafe {
                 if let Some(pb) = sb.image_buffer() {
-                    // REC_DEBUG: the camera's color tags (once).
+                    // REC_DEBUG: the camera's frame size and color tags (once).
                     static LOGGED: std::sync::Once = std::sync::Once::new();
-                    if std::env::var_os("REC_DEBUG").is_some() {
+                    let debug = std::env::var_os("REC_DEBUG").is_some();
+                    if debug {
                         LOGGED.call_once(|| {
                             let a = pb.attachments(objc2_core_video::CVAttachmentMode::ShouldPropagate);
-                            eprintln!("rec: debug: camera frame attachments: {a:?}");
+                            let (w, h) = (objc2_core_video::CVPixelBufferGetWidth(&pb), objc2_core_video::CVPixelBufferGetHeight(&pb));
+                            eprintln!("rec: debug: camera frame {w}x{h}, attachments: {a:?}");
                         });
                     }
                     let pts = sb.presentation_time_stamp();
+                    let bars = {
+                        let mut t = self.ivars().bars.lock().unwrap();
+                        let before = t.current();
+                        let bars = t.frame(secs(pts), &pb);
+                        if debug && bars != before {
+                            eprintln!("rec: debug: camera black bars to crop: {bars:?}");
+                        }
+                        bars
+                    };
                     let shared = self.ivars().shared.lock().unwrap().clone();
-                    shared.with(|s| s.push_cam(pts, pb));
+                    shared.with(|s| s.push_cam(pts, pb, bars));
                 }
             }
         }
@@ -217,6 +231,7 @@ impl Camera {
             let name = dev.localizedName().to_string();
             let session = AVCaptureSession::new();
             session.beginConfiguration();
+            // Used only if the device can't be configured below.
             if session.canSetSessionPreset(AVCaptureSessionPreset1280x720) {
                 session.setSessionPreset(AVCaptureSessionPreset1280x720);
             } else {
@@ -228,6 +243,10 @@ impl Camera {
                 bail!("cannot use camera {name}");
             }
             session.addInput(&input);
+            // Pick the format here. A preset takes the first format of its
+            // size, and on some cameras (a DJI Osmo Pocket 3) that can be a
+            // portrait one with the landscape picture letterboxed inside.
+            let (picked, lock) = use_best_format(&dev).unzip();
             let output = AVCaptureVideoDataOutput::new();
             output.setVideoSettings(Some(&dict(vec![(
                 cf_ns(kCVPixelBufferPixelFormatTypeKey),
@@ -243,8 +262,15 @@ impl Camera {
             session.addOutput(&output);
             session.commitConfiguration();
             session.startRunning();
+            // Running on our format now: the session won't change it.
+            drop(lock);
             if !session.isRunning() {
                 bail!("camera {name} failed to start");
+            }
+            if std::env::var_os("REC_DEBUG").is_some() {
+                let f = format_info(&dev.activeFormat());
+                let now = format!("{}x{} at {:.2} fps", f.width, f.height, 1.0 / dev.activeVideoMinFrameDuration().seconds());
+                eprintln!("rec: debug: camera {name}: picked {picked:?}; running {now}, preset {}", session.sessionPreset());
             }
             let id = dev.uniqueID().to_string();
             Ok(Camera { session, out: delegate, _queue: queue, name, id, started: std::time::Instant::now() })
@@ -252,12 +278,111 @@ impl Camera {
     }
 
     fn make_delegate(shared: Arc<Shared>) -> Retained<CameraOutput> {
-        let this = CameraOutput::alloc().set_ivars(CamIvars { shared: std::sync::Mutex::new(shared) });
+        let this = CameraOutput::alloc().set_ivars(CamIvars { shared: std::sync::Mutex::new(shared), bars: Default::default() });
         unsafe { msg_send![super(this), init] }
     }
 
     pub fn stop(&self) {
         unsafe { self.session.stopRunning() };
+    }
+}
+
+/// What `pick_format` weighs about a camera format.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct FormatInfo {
+    pub width: u32,
+    pub height: u32,
+    /// The highest frame rate it supports.
+    pub max_fps: f64,
+}
+
+/// The format to capture from, by what matters most: landscape, at least
+/// 29.9 fps, no bigger than 1080p, 16:9, then the size closest to 1280x720
+/// (bigger up to 1080p first, then smaller). Ties go to the device's own
+/// order. None for an empty list.
+pub fn pick_format(formats: &[FormatInfo]) -> Option<usize> {
+    const HD: u64 = 1280 * 720;
+    const FULL_HD: u64 = 1920 * 1080;
+    let rank = |f: &FormatInfo| {
+        let (w, h) = (f.width as u64, f.height as u64);
+        let px = w * h;
+        let empty = px == 0;
+        let portrait = w < h;
+        let slow = f.max_fps.is_nan() || f.max_fps < 29.9;
+        let huge = px > FULL_HD;
+        // More than 1% off 16:9.
+        let not_wide = (w * 9).abs_diff(h * 16) * 100 > h * 16;
+        let (smaller, distance) = if px >= HD { (false, px - HD) } else { (true, HD - px) };
+        (empty, portrait, slow, huge, not_wide, smaller, distance)
+    };
+    formats.iter().enumerate().min_by_key(|(i, f)| (rank(f), *i)).map(|(i, _)| i)
+}
+
+unsafe fn format_info(f: &AVCaptureDeviceFormat) -> FormatInfo {
+    unsafe {
+        let d = objc2_core_media::CMVideoFormatDescriptionGetDimensions(&f.formatDescription());
+        let max_fps = f.videoSupportedFrameRateRanges().iter().map(|r| r.maxFrameRate()).fold(0.0, f64::max);
+        FormatInfo { width: d.width.max(0) as u32, height: d.height.max(0) as u32, max_fps }
+    }
+}
+
+/// The frame duration that runs `f` at 30 fps, and whether its range is a
+/// single rate (then the longest duration is set too, so it can't drop to
+/// another rate). Cameras report "30" as 30.00003, so a range topping out
+/// near 30 uses its own shortest duration rather than exactly 1/30 s,
+/// which would be out of range and throw.
+unsafe fn thirty_fps(f: &AVCaptureDeviceFormat) -> Option<(objc2_core_media::CMTime, bool)> {
+    unsafe {
+        let r = f.videoSupportedFrameRateRanges().iter().find(|r| r.minFrameRate() <= 30.01 && r.maxFrameRate() >= 29.99)?;
+        let fixed = r.maxFrameRate() - r.minFrameRate() < 0.5;
+        let d = if r.maxFrameRate() < 30.5 { r.minFrameDuration() } else { objc2_core_media::CMTime::new(1, 30) };
+        Some((d, fixed))
+    }
+}
+
+/// A device's configuration lock, released on drop.
+struct ConfigLock<'a>(&'a AVCaptureDevice);
+
+impl Drop for ConfigLock<'_> {
+    fn drop(&mut self) {
+        unsafe { self.0.unlockForConfiguration() };
+    }
+}
+
+/// Set `dev` (added to a session, inside its begin/commit configuration)
+/// to the format `pick_format` chooses, at 30 fps where it can. Returns
+/// the format and the device's lock. Hold the lock until the session runs:
+/// on macOS, setting a format doesn't switch the session to the
+/// input-priority preset as it does on iOS, so the session would put back
+/// the format its own preset wants. None when the device can't be
+/// configured; the session's preset then decides.
+unsafe fn use_best_format(dev: &AVCaptureDevice) -> Option<(FormatInfo, ConfigLock<'_>)> {
+    unsafe {
+        let formats: Vec<Retained<AVCaptureDeviceFormat>> = dev.formats().iter().collect();
+        let infos: Vec<FormatInfo> = formats.iter().map(|f| format_info(f)).collect();
+        let i = pick_format(&infos)?;
+        let format = &formats[i];
+        if let Err(e) = dev.lockForConfiguration() {
+            eprintln!("rec: warning: camera settings locked ({}); using its default format", e.localizedDescription());
+            return None;
+        }
+        let lock = ConfigLock(dev);
+        let set = objc2::exception::catch(std::panic::AssertUnwindSafe(|| {
+            dev.setActiveFormat(format);
+            if let Some((d, fixed)) = thirty_fps(format) {
+                dev.setActiveVideoMinFrameDuration(d);
+                if fixed {
+                    dev.setActiveVideoMaxFrameDuration(d);
+                }
+            }
+        }));
+        match set {
+            Ok(()) => Some((infos[i], lock)),
+            Err(e) => {
+                eprintln!("rec: warning: could not set the camera format: {}", e.map(|e| format!("{e:?}")).unwrap_or_default());
+                None
+            }
+        }
     }
 }
 
@@ -345,5 +470,140 @@ mod tests {
         // By name substring (CLI).
         assert_eq!(match_mic(&mics, "macbook", None).as_deref(), Some("BuiltInMicrophoneDevice"));
         assert_eq!(match_mic(&mics[..1], "AppleUSBAudioEngine:DJI:DJIPocket3:123456789ABCDEF:4", Some("OsmoPocket3")), None);
+    }
+
+    fn fmt(width: u32, height: u32, max_fps: f64) -> FormatInfo {
+        FormatInfo { width, height, max_fps }
+    }
+
+    fn picked(formats: &[FormatInfo]) -> Option<(u32, u32, f64)> {
+        pick_format(formats).map(|i| (formats[i].width, formats[i].height, formats[i].max_fps))
+    }
+
+    /// The formats a DJI Osmo Pocket 3 lists, in its order: 420v then 2vuy
+    /// at each size, with their top frame rate ("30" is 30.00003). Its idle
+    /// format is 1080x1920, a portrait one.
+    const OSMO: [(u32, u32, f64); 10] = [
+        (720, 1280, 30.00003),
+        (720, 1280, 30.00003),
+        (1080, 1920, 30.00003),
+        (1080, 1920, 30.00003),
+        (1280, 720, 30.00003),
+        (1280, 720, 30.00003),
+        (1920, 1080, 30.00003),
+        (1920, 1080, 30.00003),
+        (3840, 2160, 30.00003),
+        (3840, 2160, 60.0),
+    ];
+
+    fn osmo() -> Vec<FormatInfo> {
+        OSMO.iter().map(|&(w, h, f)| fmt(w, h, f)).collect()
+    }
+
+    #[test]
+    fn osmo_pocket_3_gets_landscape_720p() {
+        let osmo = osmo();
+        // The first 1280x720 (420v), not a portrait format.
+        assert_eq!(pick_format(&osmo), Some(4));
+        assert_eq!(picked(&osmo), Some((1280, 720, 30.00003)));
+        // Without 720p: 1080p, not 4K and not portrait.
+        let no_720: Vec<FormatInfo> = osmo.iter().copied().filter(|f| f.height != 720).collect();
+        assert_eq!(picked(&no_720), Some((1920, 1080, 30.00003)));
+        // 4K only when nothing else is landscape.
+        let portrait_and_4k: Vec<FormatInfo> = osmo.iter().copied().filter(|f| f.width < f.height || f.width > 1920).collect();
+        assert_eq!(portrait_and_4k.len(), 6);
+        assert_eq!(picked(&portrait_and_4k), Some((3840, 2160, 30.00003)));
+    }
+
+    #[test]
+    fn built_in_and_continuity_cameras_keep_720p() {
+        // A MacBook camera (shapes for Center Stage and Desk View too).
+        let mac = [
+            fmt(1920, 1080, 30.0),
+            fmt(1760, 1328, 30.0),
+            fmt(1552, 1552, 30.0),
+            fmt(1080, 1920, 30.0),
+            fmt(1280, 720, 30.0),
+            fmt(640, 480, 30.0),
+        ];
+        assert_eq!(picked(&mac), Some((1280, 720, 30.0)));
+        // An iPhone as a Continuity Camera.
+        let phone = [fmt(640, 480, 60.0), fmt(1920, 1440, 30.0), fmt(3840, 2160, 30.0), fmt(1920, 1080, 60.0), fmt(1280, 720, 60.0)];
+        assert_eq!(picked(&phone), Some((1280, 720, 60.0)));
+        // An old 4:3 webcam: the size closest to 720p, larger first.
+        let old = [fmt(640, 480, 30.0), fmt(1600, 1200, 15.0), fmt(1024, 768, 30.0), fmt(800, 600, 30.0)];
+        assert_eq!(picked(&old), Some((1024, 768, 30.0)));
+    }
+
+    #[test]
+    fn frame_rate_and_fallbacks() {
+        // 720p only at 15 fps: 1080p at 30 instead.
+        assert_eq!(picked(&[fmt(1280, 720, 15.0), fmt(1920, 1080, 30.0)]), Some((1920, 1080, 30.0)));
+        // Nothing at 30 fps: still landscape 720p.
+        assert_eq!(picked(&[fmt(720, 1280, 15.0), fmt(1280, 720, 15.0), fmt(1920, 1080, 10.0)]), Some((1280, 720, 15.0)));
+        // Portrait only: the one closest to 720p (the bars, if any, are
+        // cropped by `bars`).
+        assert_eq!(picked(&[fmt(1080, 1920, 30.0), fmt(720, 1280, 30.0)]), Some((720, 1280, 30.0)));
+        // A broken entry never wins.
+        assert_eq!(picked(&[fmt(0, 0, 30.0), fmt(320, 240, 5.0)]), Some((320, 240, 5.0)));
+        assert_eq!(pick_format(&[]), None);
+    }
+
+    /// Open a real camera through `Camera::start` for a few seconds and
+    /// print its format and the bars found, after doing the same with the
+    /// old preset-only setup. Run with --ignored --nocapture; REC_CAMERA
+    /// names the camera. Frames go nowhere and only sizes are printed.
+    /// Skips without asking for camera access, and when another app is
+    /// using the camera.
+    #[test]
+    #[ignore]
+    fn live_camera() {
+        use std::sync::Mutex;
+        use std::sync::atomic::AtomicBool;
+        use std::time::Duration;
+        if crate::tcc::camera_status() != crate::tcc::Status::Granted {
+            println!("camera access is {}; skipped", crate::tcc::camera_status());
+            return;
+        }
+        let sel = std::env::var("REC_CAMERA").ok();
+        let dev = Camera::device(sel.as_deref()).unwrap();
+        let name = unsafe { dev.localizedName() };
+        if unsafe { dev.isInUseByAnotherApplication() } {
+            println!("{name} is in use by another app; skipped");
+            return;
+        }
+        let shared = || Arc::new(Shared { sink: Mutex::new(None), error: Mutex::new(None), stop: Arc::new(AtomicBool::new(false)) });
+        let report = |what: &str, out: &CameraOutput| unsafe {
+            let f = format_info(&dev.activeFormat());
+            let bars = out.ivars().bars.lock().unwrap().current();
+            println!("{what}: {name} at {}x{} (up to {:.2} fps), bars cropped: {bars:?}", f.width, f.height, f.max_fps);
+        };
+        let formats: Vec<String> = unsafe {
+            dev.formats().iter().map(|f| format_info(&f)).map(|f| format!("{}x{}@{:.2}", f.width, f.height, f.max_fps)).collect()
+        };
+        println!("{name} formats: {}", formats.join(", "));
+        // The old setup: a 1280x720 preset and nothing else.
+        unsafe {
+            let session = AVCaptureSession::new();
+            session.beginConfiguration();
+            session.setSessionPreset(AVCaptureSessionPreset1280x720);
+            let input = AVCaptureDeviceInput::deviceInputWithDevice_error(&dev).unwrap();
+            session.addInput(&input);
+            let output = AVCaptureVideoDataOutput::new();
+            output.setVideoSettings(Some(&dict(vec![(cf_ns(kCVPixelBufferPixelFormatTypeKey), num_i(PIX_BGRA as i64))])));
+            let delegate = Camera::make_delegate(shared());
+            let queue = DispatchQueue::new("rec.camera.test", None);
+            output.setSampleBufferDelegate_queue(Some(ProtocolObject::from_ref(&*delegate)), Some(&queue));
+            session.addOutput(&output);
+            session.commitConfiguration();
+            session.startRunning();
+            std::thread::sleep(Duration::from_secs(3));
+            report("preset only", &delegate);
+            session.stopRunning();
+        }
+        let cam = Camera::start(sel.as_deref(), shared()).unwrap();
+        std::thread::sleep(Duration::from_secs(3));
+        report("Camera::start", &cam.out);
+        cam.stop();
     }
 }

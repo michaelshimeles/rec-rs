@@ -1,4 +1,5 @@
 mod app;
+mod bars;
 mod camera;
 mod compose;
 mod hotkey;

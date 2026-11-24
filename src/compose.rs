@@ -6,6 +6,7 @@ use objc2_core_graphics::{CGColorSpace, kCGColorSpaceSRGB};
 use objc2_core_image::{CIColor, CIContext, CIImage};
 use objc2_core_video::CVPixelBuffer;
 
+use crate::bars::Bars;
 use crate::util::*;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum, serde::Serialize, serde::Deserialize)]
@@ -461,11 +462,23 @@ impl Compositor {
         self.decor.as_ref().unwrap()
     }
 
-    pub fn render(&mut self, scene: Scene, screen: Option<&CVPixelBuffer>, cam: Option<&CVPixelBuffer>, out: &CVPixelBuffer) {
+    /// Draw one output frame. `cam` comes with the black bars to crop off
+    /// it (see `bars`).
+    pub fn render(&mut self, scene: Scene, screen: Option<&CVPixelBuffer>, cam: Option<(&CVPixelBuffer, Bars)>, out: &CVPixelBuffer) {
         unsafe {
             let canvas = rect(0.0, 0.0, self.w, self.h);
             let black = CIImage::imageWithColor(&CIColor::colorWithRed_green_blue(0.0, 0.0, 0.0)).imageByCroppingToRect(canvas);
-            let cam = cam.map(|c| CIImage::imageWithCVPixelBuffer(c));
+            // The camera's picture without its bars. Its extent's origin is
+            // then off zero, and the placements below account for that.
+            let cam = cam.map(|(c, bars)| {
+                let img = CIImage::imageWithCVPixelBuffer(c);
+                if bars.is_none() {
+                    return img;
+                }
+                let e = img.extent();
+                let (x, y, w, h) = bars.picture(e.size.width, e.size.height);
+                img.imageByCroppingToRect(rect(x, y, w, h))
+            });
             if let Some(c) = &cam {
                 let e = c.extent();
                 if e.size.height > 0.0 {
@@ -478,7 +491,7 @@ impl Compositor {
                     let e = c.extent();
                     let (s, tx, ty) = fit(e.size.width, e.size.height, self.w, self.h, true);
                     let (a, tx) = if self.pip.mirror { (-s, self.w - tx) } else { (s, tx) };
-                    let t = CGAffineTransform { a, b: 0.0, c: 0.0, d: s, tx, ty };
+                    let t = CGAffineTransform { a, b: 0.0, c: 0.0, d: s, tx: tx - a * e.origin.x, ty: ty - s * e.origin.y };
                     img = c.imageByApplyingTransform(t).imageByCroppingToRect(canvas).imageByCompositingOverImage(&img);
                 }
                 self.ctx.render_toCVPixelBuffer_bounds_colorSpace(&img, out, canvas, Some(&self.cs));
@@ -673,7 +686,7 @@ mod tests {
             ..Default::default()
         };
         let mut c = Compositor::new(640, 360, pip.clone());
-        c.render(Scene::ScreenCam, Some(&screen), Some(&cam), &out);
+        c.render(Scene::ScreenCam, Some(&screen), Some((&cam, Bars::NONE)), &out);
         let [x, y, w, h] = overlay_rect(&pip, 640.0, 360.0, c.cam_aspect());
         assert_eq!([x, y, w, h], [240.0, 10.0, 160.0, 160.0]);
         let px = |px: usize, py: usize| unsafe {
@@ -694,9 +707,146 @@ mod tests {
         assert!(black(px(320, 200)), "screen below the overlay: {:?}", px(320, 200));
         // Moving the overlay is live.
         c.set_pip(PipSpec { place: Place::Corner(Corner::BottomLeft), ..pip });
-        c.render(Scene::ScreenCam, Some(&screen), Some(&cam), &out);
+        c.render(Scene::ScreenCam, Some(&screen), Some((&cam, Bars::NONE)), &out);
         assert!(black(px(320, 90)), "old position is screen again");
         assert!(red(px(13 + 80, 360 - 13 - 80)), "new position: {:?}", px(93, 267));
+    }
+
+    /// A `w`x`h` BGRA frame painted by `f(x, y)`.
+    pub(crate) fn paint(w: usize, h: usize, f: impl Fn(usize, usize) -> [u8; 4]) -> CFRetained<CVPixelBuffer> {
+        use objc2_core_video::*;
+        let pool = make_pool(w, h, PIX_BGRA);
+        let mut b = std::ptr::null_mut();
+        unsafe {
+            CVPixelBufferPool::create_pixel_buffer(None, &pool, std::ptr::NonNull::from(&mut b));
+            let b: CFRetained<CVPixelBuffer> = CFRetained::from_raw(std::ptr::NonNull::new(b).unwrap());
+            CVPixelBufferLockBaseAddress(&b, CVPixelBufferLockFlags(0));
+            let base = CVPixelBufferGetBaseAddress(&b) as *mut u8;
+            let stride = CVPixelBufferGetBytesPerRow(&b);
+            for y in 0..h {
+                for x in 0..w {
+                    std::ptr::copy_nonoverlapping(f(x, y).as_ptr(), base.add(y * stride + x * 4), 4);
+                }
+            }
+            CVPixelBufferUnlockBaseAddress(&b, CVPixelBufferLockFlags(0));
+            b
+        }
+    }
+
+    /// [B, G, R] of one pixel.
+    fn pixel(b: &CVPixelBuffer, x: usize, y: usize) -> [u8; 3] {
+        use objc2_core_video::*;
+        unsafe {
+            CVPixelBufferLockBaseAddress(b, CVPixelBufferLockFlags::ReadOnly);
+            let p = (CVPixelBufferGetBaseAddress(b) as *const u8).add(y * CVPixelBufferGetBytesPerRow(b) + x * 4);
+            let v = [*p, *p.add(1), *p.add(2)];
+            CVPixelBufferUnlockBaseAddress(b, CVPixelBufferLockFlags::ReadOnly);
+            v
+        }
+    }
+
+    /// With REC_EVIDENCE_DIR set, save `b` there as `<name>.png` (needs ffmpeg).
+    fn save_png(b: &CVPixelBuffer, name: &str) {
+        use objc2_core_video::*;
+        let Some(dir) = std::env::var_os("REC_EVIDENCE_DIR") else { return };
+        let dir = std::path::PathBuf::from(dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (w, h) = (CVPixelBufferGetWidth(b), CVPixelBufferGetHeight(b));
+        let mut raw = Vec::with_capacity(w * h * 4);
+        unsafe {
+            CVPixelBufferLockBaseAddress(b, CVPixelBufferLockFlags::ReadOnly);
+            let base = CVPixelBufferGetBaseAddress(b) as *const u8;
+            for y in 0..h {
+                raw.extend_from_slice(std::slice::from_raw_parts(base.add(y * CVPixelBufferGetBytesPerRow(b)), w * 4));
+            }
+            CVPixelBufferUnlockBaseAddress(b, CVPixelBufferLockFlags::ReadOnly);
+        }
+        let tmp = dir.join(format!("{name}.bgra"));
+        std::fs::write(&tmp, raw).unwrap();
+        let ok = std::process::Command::new("ffmpeg")
+            .args(["-y", "-loglevel", "error", "-f", "rawvideo", "-pix_fmt", "bgra", "-s", &format!("{w}x{h}"), "-i"])
+            .arg(&tmp)
+            .arg(dir.join(format!("{name}.png")))
+            .status()
+            .is_ok_and(|s| s.success());
+        std::fs::remove_file(&tmp).unwrap();
+        assert!(ok, "ffmpeg could not write {name}.png");
+    }
+
+    /// What an Osmo Pocket 3 sends on a portrait format: a 720x1280 frame
+    /// with its 16:9 picture (720x405) in the middle and black above and
+    /// below.
+    pub(crate) fn letterboxed_cam() -> CFRetained<CVPixelBuffer> {
+        let (top, ph) = (437, 405);
+        paint(720, 1280, |x, y| {
+            if y < top || y >= top + ph {
+                return [0, 0, 0, 255];
+            }
+            let (u, v) = (x as f64 / 720.0, (y - top) as f64 / ph as f64);
+            // A sky-to-grass gradient with an orange disc in the middle.
+            let (dx, dy) = ((u - 0.5) * 16.0 / 9.0, v - 0.5);
+            if dx * dx + dy * dy < 0.09 {
+                return [60, 150, 240, 255];
+            }
+            let r = 60.0 + 80.0 * u;
+            let g = 130.0 + 90.0 * v;
+            let b = 210.0 - 120.0 * v;
+            [b as u8, g as u8, r as u8, 255]
+        })
+    }
+
+    /// A letterboxed camera frame fills the overlay and the Camera scene
+    /// with picture, edge to edge.
+    #[test]
+    fn letterboxed_camera_shows_no_bars() {
+        let (w, h) = (1280usize, 720usize);
+        let screen = paint(w, h, |x, y| if (x / 80 + y / 80) % 2 == 0 { [70, 64, 60, 255] } else { [86, 80, 76, 255] });
+        let cam = letterboxed_cam();
+        save_png(&cam, "camera-input");
+        let out = paint(w, h, |_, _| [0, 255, 0, 255]);
+        let pip = PipSpec { size: 0.3, ..Default::default() };
+        let mut c = Compositor::new(w, h, pip.clone());
+        let lum = |v: [u8; 3]| (v[0] as u32 * 19 + v[1] as u32 * 183 + v[2] as u32 * 54) / 256;
+        let orange = |v: [u8; 3]| v[2] > 200 && (120..180).contains(&v[1]) && v[0] < 100;
+        let mut problems = Vec::new();
+        // The camera thread measures the bars as frames arrive (30 fps, 2 s).
+        let mut tracker = crate::bars::Tracker::default();
+        let bars = (0..60).map(|i| tracker.frame(i as f64 / 30.0, &cam)).last().unwrap();
+        let cam = Some((&*cam, bars));
+
+        c.render(Scene::ScreenCam, Some(&screen), cam, &out);
+        save_png(&out, "screen-and-camera");
+        let [x, y, ow, oh] = overlay_rect(&pip, w as f64, h as f64, c.cam_aspect());
+        if (ow / oh - 16.0 / 9.0).abs() > 0.02 {
+            problems.push(format!("overlay is {ow}x{oh} (aspect {:.3}), not 16:9", ow / oh));
+        }
+        // Down the middle of the overlay, inside its rounded corners.
+        let cx = (x + ow / 2.0) as usize;
+        for f in [0.06, 0.25, 0.5, 0.75, 0.94] {
+            let py = (y + oh * f) as usize;
+            let v = pixel(&out, cx, py);
+            if lum(v) < 40 {
+                problems.push(format!("overlay is black {:.0}% of the way down (x {cx}, y {py}): {v:?}", f * 100.0));
+            }
+        }
+        let mid = pixel(&out, cx, (y + oh / 2.0) as usize);
+        if !orange(mid) {
+            problems.push(format!("the picture's middle is not in the overlay's middle: {mid:?}"));
+        }
+
+        c.render(Scene::Cam, None, cam, &out);
+        save_png(&out, "camera-scene");
+        for (px, py) in [(w / 2, 1), (w / 2, h / 2), (w / 2, h - 2), (1, h / 2), (w - 2, h / 2)] {
+            let v = pixel(&out, px, py);
+            if lum(v) < 40 {
+                problems.push(format!("camera scene is black at ({px}, {py}): {v:?}"));
+            }
+        }
+        let mid = pixel(&out, w / 2, h / 2);
+        if !orange(mid) {
+            problems.push(format!("the picture's middle is not in the camera scene's middle: {mid:?}"));
+        }
+        assert!(problems.is_empty(), "black bars:\n  {}", problems.join("\n  "));
     }
 }
 
@@ -762,7 +912,7 @@ pub(crate) mod color_probe {
             ] {
                 let vals: Vec<u8> = [32u8, 64, 128, 192].iter().map(|&v| {
                     let cam = gray(v, tag);
-                    c.render(Scene::Cam, None, Some(&cam), &out);
+                    c.render(Scene::Cam, None, Some((&cam, Bars::NONE)), &out);
                     center(&out)
                 }).collect();
                 println!("{name}: in [32, 64, 128, 192] -> {vals:?}");
