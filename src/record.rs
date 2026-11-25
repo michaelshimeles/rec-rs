@@ -251,6 +251,7 @@ impl Session {
         if write && o.files.separate() {
             let [screen, cam] = crate::separate::paths(&o.output);
             sink.write_separate(&screen, &cam, &spec, o.audio_layout, o.pip.mirror)?;
+            sink.set_cam_adjust(&o.cam_adjust);
         }
         // System audio from ScreenCaptureKit is captured when mixed and heard
         // one output latency later; the synthetic source needs no shift.
@@ -344,7 +345,7 @@ impl Session {
                 let settle = if letterbox { CROP_SETTLE_SECS } else { 0.0 };
                 self.shared.with(|s| s.wait_for_camera(settle));
             }
-            self.test_cam = Some(TestCamera::start(letterbox, self.shared.clone()));
+            self.test_cam = Some(TestCamera::start(letterbox, o.cam_resolution, self.shared.clone()));
             return self.start_screen(o, target, pixel_format);
         }
         let mut cam = cam;

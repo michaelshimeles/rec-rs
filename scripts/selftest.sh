@@ -73,6 +73,7 @@ separate() {
 }
 separate separate 300 1280x720 --test-camera -t 5
 separate separate-letterbox 240 720x400 --test-camera=letterbox --composed -t 4
+separate separate-1080p 180 1920x1080 --test-camera --cam-resolution 1080p -t 3
 "$REC" record -q --test-pattern --no-mic --test-camera --separate -t 5 -o "$OUT/sep-pause.mov" >/dev/null 2>"$OUT/sep-pause.log" &
 sleep 2.3; "$REC" pause || true; sleep 2; "$REC" resume || true; wait || true
 if scripts/trackcheck.py "$OUT/sep-pause-screen.mov" "$OUT/sep-pause-camera.mov" --frames 300 --window 1 >"$OUT/sep-pause.check" 2>&1 \

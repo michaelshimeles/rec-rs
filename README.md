@@ -438,11 +438,15 @@ the same time. Edit them apart later: move, resize or cut the camera in an edito
 - **The camera's picture.** This is the camera's own frame, not the overlay. It has no shape,
   border or shadow, and Rec doesn't crop it to the overlay's aspect ratio. Rec does crop black
   bars off, as it does for the overlay. The file keeps the size the picture has when the
-  recording starts. If the crop changes mid-take, Rec scales the picture to fit that size. A
-  camera started cold gets 2 s for its crop to settle before the files start. The picture
-  follows the Mirror switch, like the composed video, and Mirror is on by default. Turn it off
-  for an unmirrored camera file. Colors take the same CoreImage path as the overlay, so the
-  camera looks the same in both files.
+  recording starts, so the camera's 720p or 1080p setting sets it. If the crop changes
+  mid-take, Rec scales the picture to fit that size. A camera started cold gets 2 s for its crop
+  to settle before the files start. The picture follows the Mirror switch, like the composed
+  video, and Mirror is on by default. Turn it off for an unmirrored camera file.
+- **The camera's look.** The camera file gets the same software adjustments as the preview and
+  the composed video: white balance and tint, exposure, brightness, contrast, saturation,
+  sharpness and noise reduction, also when they change mid-take. It goes through the same
+  CoreImage path, so the camera looks the same in every file. A neutral look adds no filter.
+  The zebras and the grid stay in the preview and never reach a file.
 - **Frame rate and codec.** Both files use the output frame rate, codec and container. Cameras
   send 30 fps, so in a 60 fps recording each camera frame shows for two frames, as in the
   composed video. The camera's file gets a bitrate for its own size. Each file has its own

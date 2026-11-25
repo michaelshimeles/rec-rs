@@ -221,6 +221,12 @@ max in % of one core, and its peak memory. 1080p60 H.264.
 - On this shared machine the numbers move between runs: the 10-minute take with all three files
   averaged 56.4%, the 60 s take 46.1%. After the review fixes, a repeat of the 60 s separate
   take used 31.4% / 35.5% and again passed `trackcheck.py --strict` at 0.000 ms.
+- After merging main with the camera look (#19), the same 60 s take passed `--strict` at 0.000
+  ms at the start and the end with 0.000 ms drift, at 41.7% / 45.4%. Exact CPU time over
+  alternating 20 s takes put this about 5 points above the build before the merge, with the
+  merge alone (32.8 to 41.9%) and with the look wired into the camera file (36.1 to 39.8%)
+  alike, against 30.6 to 34.0% before. The bump came with the merge, not the look wiring, and
+  the numbers vary from run to run.
 
 ### A stall seen once
 

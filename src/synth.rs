@@ -247,8 +247,9 @@ impl Synth {
 
 /// A generated camera (`--test-camera`), for self-tests without a webcam
 /// or the Camera permission. It sends 30 fps on the host clock like a real
-/// camera: a 1280x720 picture, or with `letterbox` a 720x1280 frame with
-/// a 16:9 picture in the middle and black above and below (what a DJI
+/// camera, at the size `--cam-resolution` asks for: a 1280x720 (or
+/// 1920x1080) picture, or with `letterbox` a 720x1280 (1080x1920) frame
+/// with a 16:9 picture in the middle and black above and below (what a DJI
 /// Osmo Pocket 3 sends on a portrait format). Like the screen pattern, it
 /// flashes white at the start of every second and carries the time code
 /// of each frame's capture time, so the screen's and the camera's files
@@ -261,8 +262,16 @@ pub struct TestCamera {
 pub const TEST_CAMERA_FPS: i64 = 30;
 
 /// The test camera's frame size and its picture inside it (x, y, w, h).
-pub fn test_camera_frame(letterbox: bool) -> ((usize, usize), (usize, usize, usize, usize)) {
-    if letterbox { ((720, 1280), (0, 437, 720, 405)) } else { ((1280, 720), (0, 0, 1280, 720)) }
+pub fn test_camera_frame(letterbox: bool, res: crate::camera::CamResolution) -> ((usize, usize), (usize, usize, usize, usize)) {
+    let (w, h) = res.size();
+    let (w, h) = (w as usize, h as usize);
+    if letterbox {
+        // The 16:9 picture across a portrait frame's width, centered.
+        let ph = (h * 9 + 8) / 16;
+        ((h, w), (0, (w - ph) / 2, h, ph))
+    } else {
+        ((w, h), (0, 0, w, h))
+    }
 }
 
 /// Draw test camera frame `m`, captured at `ticks`, into `pb` (BGRA).
@@ -305,10 +314,10 @@ fn draw_camera(pb: &CVPixelBuffer, pic: (usize, usize, usize, usize), background
 }
 
 impl TestCamera {
-    pub fn start(letterbox: bool, shared: Arc<Shared>) -> TestCamera {
+    pub fn start(letterbox: bool, res: crate::camera::CamResolution, shared: Arc<Shared>) -> TestCamera {
         let stop = Arc::new(AtomicBool::new(false));
         let stop2 = stop.clone();
-        let ((w, h), pic) = test_camera_frame(letterbox);
+        let ((w, h), pic) = test_camera_frame(letterbox, res);
         let pool = SendBox(make_pool(w, h, PIX_BGRA));
         // A muted blue-to-olive gradient: bright enough everywhere that its
         // edges never read as black bars, dark enough (luma under 140) for
@@ -402,9 +411,19 @@ mod tests {
     }
 
     #[test]
+    fn test_camera_sizes_follow_the_resolution() {
+        use crate::camera::CamResolution::{Hd720, Hd1080};
+        assert_eq!(test_camera_frame(false, Hd720), ((1280, 720), (0, 0, 1280, 720)));
+        assert_eq!(test_camera_frame(false, Hd1080), ((1920, 1080), (0, 0, 1920, 1080)));
+        // Like the Osmo on a portrait format.
+        assert_eq!(test_camera_frame(true, Hd720), ((720, 1280), (0, 437, 720, 405)));
+        assert_eq!(test_camera_frame(true, Hd1080), ((1080, 1920), (0, 656, 1080, 608)));
+    }
+
+    #[test]
     fn time_code_reads_back() {
-        for letterbox in [false, true] {
-            let ((w, h), pic) = test_camera_frame(letterbox);
+        for (letterbox, res) in [false, true].into_iter().flat_map(|l| crate::camera::CamResolution::ALL.map(|r| (l, r))) {
+            let ((w, h), pic) = test_camera_frame(letterbox, res);
             let pool = make_pool(w, h, PIX_BGRA);
             let mut buf = std::ptr::null_mut();
             unsafe { CVPixelBufferPool::create_pixel_buffer(None, &pool, std::ptr::NonNull::from(&mut buf)) };
@@ -414,7 +433,7 @@ mod tests {
             let ticks = 3 * 86_400 * 60_000i64 + 123_456;
             for m in [0, 7] {
                 draw_camera(&pb, pic, &background, m, ticks);
-                assert_eq!(read_code(&pb, (pic.0, pic.1), pic.2), Some(ticks as u32), "letterbox {letterbox}, frame {m}");
+                assert_eq!(read_code(&pb, (pic.0, pic.1), pic.2), Some(ticks as u32), "letterbox {letterbox}, {res:?}, frame {m}");
             }
             // The camera's bars are found like a real camera's.
             let bars = crate::bars::measure_bgra(&pb).unwrap();

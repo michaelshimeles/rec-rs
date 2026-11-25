@@ -724,10 +724,14 @@ impl Sink {
         }
     }
 
-    /// Change the camera's software adjustments live.
+    /// Change the camera's software adjustments live: in the composed
+    /// frame and the camera's own file alike.
     pub fn set_cam_adjust(&mut self, adjust: &crate::look::Adjust) {
         if let Some(c) = self.compositor.as_mut() {
             c.set_adjust(adjust);
+        }
+        if let Some(s) = self.sep.as_mut() {
+            s.cam.render.set_adjust(adjust);
         }
     }
 
@@ -1635,6 +1639,79 @@ mod tests {
         let err = r.err().map(|e| format!("{e:#}"));
         assert!(err.as_deref().is_some_and(|e| e.contains("camera file")), "finish returned {err:?}");
         assert!(screen.exists(), "the screen's file is kept");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A `w`x`h` BGRA frame painted by `f(x, y)`.
+    fn painted(w: usize, h: usize, f: impl Fn(usize, usize) -> [u8; 4]) -> objc2_core_foundation::CFRetained<objc2_core_video::CVPixelBuffer> {
+        use objc2_core_video::*;
+        let b = frame(w, h);
+        unsafe {
+            CVPixelBufferLockBaseAddress(&b, CVPixelBufferLockFlags(0));
+            let base = CVPixelBufferGetBaseAddress(&b) as *mut u8;
+            let stride = CVPixelBufferGetBytesPerRow(&b);
+            for y in 0..h {
+                for x in 0..w {
+                    std::ptr::copy_nonoverlapping(f(x, y).as_ptr(), base.add(y * stride + x * 4), 4);
+                }
+            }
+            CVPixelBufferUnlockBaseAddress(&b, CVPixelBufferLockFlags(0));
+        }
+        b
+    }
+
+    /// The BGRA bytes of a frame, row by row.
+    fn pixels(b: &objc2_core_video::CVPixelBuffer) -> Vec<u8> {
+        use objc2_core_video::*;
+        let (w, h) = (CVPixelBufferGetWidth(b), CVPixelBufferGetHeight(b));
+        let mut out = Vec::with_capacity(w * h * 4);
+        unsafe {
+            CVPixelBufferLockBaseAddress(b, CVPixelBufferLockFlags::ReadOnly);
+            let base = CVPixelBufferGetBaseAddress(b) as *const u8;
+            for y in 0..h {
+                out.extend_from_slice(std::slice::from_raw_parts(base.add(y * CVPixelBufferGetBytesPerRow(b)), w * 4));
+            }
+            CVPixelBufferUnlockBaseAddress(b, CVPixelBufferLockFlags::ReadOnly);
+        }
+        out
+    }
+
+    /// The camera's file gets the camera look (`look`, set live with
+    /// `set_cam_adjust`), the same picture the composed video's Camera scene
+    /// shows. Here both are 64x36, unmirrored, so they match pixel for pixel.
+    #[test]
+    fn camera_file_gets_the_camera_look() {
+        use super::*;
+        use crate::look::Adjust;
+        let look = Adjust { temperature: 3200.0, exposure: 0.7, saturation: 40.0, ..Adjust::NEUTRAL };
+        let cam = painted(64, 36, |x, y| [(40 + x * 3) as u8, (60 + y * 4) as u8, (200 - x * 2) as u8, 255]);
+        // What the compositor draws for the Camera scene, with and without the look.
+        let composed = |a: &Adjust| {
+            let out = painted(64, 36, |_, _| [0, 255, 0, 255]);
+            let mut c = crate::compose::Compositor::new(64, 36, crate::compose::PipSpec { mirror: false, ..Default::default() });
+            c.set_adjust(a);
+            c.render(Scene::Cam, None, Some((&cam, crate::bars::Bars::NONE)), &out);
+            pixels(&out)
+        };
+        let (plain, adjusted) = (composed(&Adjust::NEUTRAL), composed(&look));
+        assert!(plain.iter().zip(&adjusted).any(|(a, b)| a.abs_diff(*b) > 20), "the look changes the picture");
+
+        let dir = std::env::temp_dir().join(format!("rec-sep-look-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let v = VideoSpec { width: 64, height: 36, fps: 30, codec: Codec::H264, bitrate: 1_000_000, pixel_format: crate::util::PIX_BGRA };
+        let comp = crate::compose::Compositor::new(64, 36, crate::compose::PipSpec { mirror: false, ..Default::default() });
+        let vols = [Volume { db: 0.0, muted: false }; 2];
+        let mut s = Sink::new(None, &v, false, false, AudioLayout::Both, vols, Some(comp), Scene::Cam, None).unwrap();
+        s.write_separate(&dir.join("l-screen.mov"), &dir.join("l-camera.mov"), &v, AudioLayout::Both, false).unwrap();
+        s.set_cam_adjust(&look);
+        let t = unsafe { CMTime::new(1000 * 30, 30) };
+        s.push_cam(t, cam.clone(), crate::bars::Bars::NONE);
+        s.push_screen(t, painted(64, 36, |_, _| [0, 0, 0, 255]));
+        s.emit_until(1000.0);
+        let file = pixels(&s.separate_cam_frame().expect("the camera file's frame"));
+        let worst = file.iter().zip(&adjusted).map(|(a, b)| a.abs_diff(*b)).max().unwrap();
+        assert!(worst <= 2, "the camera file differs from the composed camera by up to {worst}");
+        let _ = s.finish(1000.0);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

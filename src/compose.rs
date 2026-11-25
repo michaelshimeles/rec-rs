@@ -955,7 +955,10 @@ pub(crate) mod tests {
         // The code that draws recorded and streamed frames.
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
         let mut files: Vec<std::path::PathBuf> =
-            ["compose.rs", "writer.rs", "record.rs", "look.rs", "scale.rs", "bars.rs", "camera.rs"].iter().map(|f| dir.join(f)).collect();
+            ["compose.rs", "writer.rs", "record.rs", "look.rs", "scale.rs", "bars.rs", "camera.rs", "separate.rs"]
+                .iter()
+                .map(|f| dir.join(f))
+                .collect();
         files.extend(std::fs::read_dir(dir.join("live")).unwrap().map(|e| e.unwrap().path()));
         for f in files {
             let text = std::fs::read_to_string(&f).unwrap();

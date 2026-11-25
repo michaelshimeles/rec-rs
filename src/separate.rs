@@ -106,13 +106,17 @@ pub fn camera_size(frame: Option<(usize, usize, Bars)>) -> (usize, usize) {
 }
 
 /// Draws camera frames for the camera's file: the picture without its
-/// black bars, mirrored when the overlay is, fitted into the file's fixed
-/// size (a crop that changes mid-take never changes the file's size).
-/// Colors go through CoreImage as in the compositor, so the camera looks
-/// the same here as in the composed video.
+/// black bars, with the camera look (`look`), mirrored when the overlay
+/// is, fitted into the file's fixed size (a crop that changes mid-take
+/// never changes the file's size). It goes through CoreImage as the
+/// compositor does, so the camera looks the same here as in the composed
+/// video and the preview. Only the look's adjustments: preview guides
+/// never reach a file.
 pub struct CamRender {
     ctx: Retained<CIContext>,
     cs: CFRetained<CGColorSpace>,
+    /// The camera look's filters; empty when it is neutral.
+    adjust: Vec<crate::look::Step>,
     /// The last frame drawn, what it was drawn from, and how.
     last: Option<Drawn>,
 }
@@ -137,7 +141,17 @@ impl CamRender {
             let opts = dict(vec![(&*ns("kCIContextCacheIntermediates"), num_b(false))]);
             let ctx = CIContext::contextWithOptions(Some(&opts));
             let cs = CGColorSpace::with_name(Some(kCGColorSpaceSRGB)).expect("sRGB colorspace");
-            CamRender { ctx, cs, last: None }
+            CamRender { ctx, cs, adjust: vec![], last: None }
+        }
+    }
+
+    /// Change the camera look live (the next frame is drawn with it). A
+    /// neutral look adds no filter.
+    pub fn set_adjust(&mut self, adjust: &crate::look::Adjust) {
+        let steps = adjust.steps();
+        if steps != self.adjust {
+            self.adjust = steps;
+            self.last = None;
         }
     }
 
@@ -180,6 +194,9 @@ impl CamRender {
                     let e = pic.extent();
                     let (x, y, pw, ph) = bars.picture(e.size.width, e.size.height);
                     pic = pic.imageByCroppingToRect(rect(x, y, pw, ph));
+                }
+                if !self.adjust.is_empty() {
+                    pic = crate::look::apply(&pic, &self.adjust);
                 }
                 let e = pic.extent();
                 if e.size.width > 0.0 && e.size.height > 0.0 {
@@ -329,6 +346,43 @@ mod tests {
         }
         let mid = pixel(&out, w / 2, h / 2);
         assert!(mid[2] > 200 && (120..180).contains(&mid[1]) && mid[0] < 100, "middle {mid:?}");
+    }
+
+    /// Every byte of a BGRA frame.
+    fn bytes(b: &CVPixelBuffer) -> Vec<u8> {
+        use objc2_core_video::*;
+        let (w, h) = (CVPixelBufferGetWidth(b), CVPixelBufferGetHeight(b));
+        let mut out = Vec::with_capacity(w * h * 4);
+        unsafe {
+            CVPixelBufferLockBaseAddress(b, CVPixelBufferLockFlags::ReadOnly);
+            let base = CVPixelBufferGetBaseAddress(b) as *const u8;
+            for y in 0..h {
+                out.extend_from_slice(std::slice::from_raw_parts(base.add(y * CVPixelBufferGetBytesPerRow(b)), w * 4));
+            }
+            CVPixelBufferUnlockBaseAddress(b, CVPixelBufferLockFlags::ReadOnly);
+        }
+        out
+    }
+
+    /// The camera look reaches the camera's file, a change redraws the
+    /// frame on hand, and a neutral look is byte for byte no look at all.
+    #[test]
+    fn camera_look_is_drawn_and_neutral_is_a_no_op() {
+        use crate::look::Adjust;
+        let cam = paint(64, 36, |x, y| [(40 + x * 3) as u8, (60 + y * 4) as u8, (200 - x * 2) as u8, 255]);
+        let mut r = CamRender::new();
+        let draw =
+            |r: &mut CamRender| bytes(&r.frame(Some((&cam, Bars::NONE)), false, || Some(paint(64, 36, |_, _| [0, 255, 0, 255]))).unwrap());
+        let plain = draw(&mut r);
+        r.set_adjust(&Adjust { temperature: 3200.0, ..Adjust::NEUTRAL });
+        let cool = draw(&mut r);
+        // 3200 K corrects for warm light: the picture turns bluer.
+        let blue = |b: &[u8]| b.chunks(4).map(|p| p[0] as i64 - p[2] as i64).sum::<i64>();
+        assert!(blue(&cool) > blue(&plain) + 64 * 36 * 10, "3200 K makes the camera file bluer");
+        r.set_adjust(&Adjust { sharpness: 2.0, noise_reduction: 1.0, ..Adjust::NEUTRAL });
+        assert_ne!(draw(&mut r), plain, "sharpness and noise reduction reach the file");
+        r.set_adjust(&Adjust::NEUTRAL);
+        assert!(draw(&mut r) == plain, "neutral is the same as no look");
     }
 
     #[test]
