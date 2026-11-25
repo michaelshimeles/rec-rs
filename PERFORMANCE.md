@@ -336,6 +336,30 @@ ideally to the preview's size:
   displays were disconnected. The numbers above are the texture's pixels,
   which the UI draws 1:1.
 
+## Camera adjustments and preview guides (2026-11-24)
+
+The compositor with a 1920x1080 camera into a 1080p frame, 240 frames per case after a warm-up
+(`cargo test --release adjustment_cost -- --ignored --nocapture`). Wall time is the render
+call, which waits for the GPU; CPU is this process's CPU time.
+
+| Camera adjustments | Camera scene: wall / CPU per frame | Screen + Cam: wall / CPU per frame |
+|---|---|---|
+| Neutral (no filters run) | 0.47 / 0.33 ms | 0.66 / 0.68 ms |
+| White balance, exposure, contrast, saturation | 0.46 / 0.34 ms | 0.71 / 0.72 ms |
+| Osmo studio preset (sharpness -1: a blur) | 1.29 / 0.72 ms | 1.53 / 1.30 ms |
+| Everything, with sharpening and noise reduction | 2.03 / 1.26 ms | 2.52 / 1.69 ms |
+
+- The color adjustments cost nothing measurable: CoreImage folds them into the pass that
+  draws the camera.
+- Softening, sharpening and noise reduction sample neighboring pixels and add about 0.8 to
+  1.6 ms of GPU time per frame. At 60 fps, the Osmo studio preset's blur adds about 2.3% of
+  one core of CPU, and everything at once about 5.6%.
+
+Zebras run on the preview worker, on its own copy of a 2780x1564 preview frame, at most
+30 times a second and only while they're on (`cargo test --release zebra_cost -- --ignored
+--nocapture`): 1.00 ms wall and 0.61 ms CPU per frame for the full-frame camera, 2.53 ms wall
+and 1.13 ms CPU for a rounded overlay. The thirds grid is four lines drawn by the UI.
+
 ## Reproduce
 
 Quality: `scripts/quality.sh` (needs a 5K 2x display and `mediamtx` for

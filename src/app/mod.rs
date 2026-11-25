@@ -177,6 +177,14 @@ pub struct State {
     pip_applied: Option<crate::compose::PipSpec>,
     /// Audio levels last sent to the running session.
     volumes_applied: Option<[crate::mixer::Volume; 2]>,
+    /// Camera adjustments last sent to the running session.
+    adjust_applied: Option<crate::look::Adjust>,
+    /// The running session's camera: (unique ID, name).
+    pub camera_in_use: Option<(String, String)>,
+    /// The system's default camera's name (for "Default camera").
+    pub default_camera: Option<String>,
+    /// The running camera's hardware controls over USB.
+    pub uvc: crate::uvc::Hardware,
     /// Camera aspect ratio from the running session (for drag hit-testing).
     pub cam_aspect: f64,
     pub permissions_missing: bool,
@@ -276,6 +284,38 @@ impl State {
         }
     }
 
+    /// Keep the running camera in step with its saved picture settings:
+    /// the software adjustments go to the session (live in the preview,
+    /// the file and the stream), and its hardware controls are opened (and
+    /// saved values set) for the UI.
+    pub fn apply_camera(&mut self) {
+        let sess = self.recording.as_ref().or(self.preview.as_ref());
+        self.camera_in_use = sess.and_then(|s| s.camera()).map(|(id, name)| (id.to_string(), name.to_string()));
+        let (Some(sess), Some((id, name))) = (sess, &self.camera_in_use) else {
+            self.adjust_applied = None;
+            self.uvc.detach();
+            return;
+        };
+        let look = self.settings.look(name);
+        if self.adjust_applied != Some(look.adjust) {
+            sess.set_cam_adjust(&look.adjust);
+            self.adjust_applied = Some(look.adjust);
+        }
+        self.uvc.attach(id, &look.hardware);
+    }
+
+    /// The camera whose picture settings the app shows: the running one,
+    /// else the selected one.
+    pub fn look_camera(&self) -> Option<String> {
+        if let Some((_, name)) = &self.camera_in_use {
+            return Some(name.clone());
+        }
+        match &self.settings.camera {
+            Some(id) => self.cameras.iter().find(|d| &d.id == id).map(|d| d.name.clone()),
+            None => self.default_camera.clone(),
+        }
+    }
+
     /// Whether the running session can switch to `scene` live.
     pub fn can_switch_live(&self, scene: Scene) -> bool {
         let cam_running = self.recording.as_ref().is_some_and(|s| s.camera_name().is_some());
@@ -324,6 +364,7 @@ fn load_devices(st: &mut State) {
         })
         .unwrap_or_default();
     st.cameras = crate::camera::cameras().into_iter().map(|d| Device { id: d.id, name: d.name }).collect();
+    st.default_camera = crate::camera::Camera::find(None).ok().map(|d| d.name);
     st.mics = crate::camera::microphones().into_iter().map(|d| Device { id: d.id, name: d.name }).collect();
 }
 
@@ -370,6 +411,10 @@ impl App {
             permissions_missing: false,
             pip_applied: None,
             volumes_applied: None,
+            adjust_applied: None,
+            camera_in_use: None,
+            default_camera: None,
+            uvc: crate::uvc::Hardware::new(wake),
             cam_aspect: 16.0 / 9.0,
             live: crate::live::Live::new(),
             replay_stats: None,
@@ -559,6 +604,16 @@ impl App {
             eprintln!("rec: warning: {}", warning.as_deref().unwrap_or_default());
         }
         let mut args = settings.record_args(output);
+        // The camera's saved adjustments, from its first frame (they follow
+        // live changes through `apply_camera` after that).
+        if settings.scene.uses_cam()
+            && let Ok(cam) = crate::camera::Camera::find(settings.camera.as_deref())
+        {
+            let adjust = settings.look(&cam.name).adjust.to_arg();
+            if !adjust.is_empty() {
+                args.extend(["--cam-adjust".into(), adjust]);
+            }
+        }
         // REC_TEST_PATTERN: the CLI's synthetic source, for self-tests that
         // need no privacy grants.
         if std::env::var_os("REC_TEST_PATTERN").is_some() {
@@ -590,6 +645,8 @@ impl App {
     /// restart the preview if the saved mic now resolves differently.
     fn devices_changed(&mut self) {
         load_devices(&mut self.st);
+        // A camera plugged in again is a new USB device: reopen its controls.
+        self.st.uvc.detach();
         let s = &self.st.settings;
         let Some(sel) = s.mic.as_deref().filter(|_| s.mic_enabled) else { return };
         if self.st.recording.is_some() || self.st.preview.is_none() {
@@ -708,6 +765,7 @@ impl App {
                 Ok(s) => {
                     self.st.pip_applied = Some(self.st.settings.pip_spec());
                     self.st.volumes_applied = Some(self.st.settings.volumes());
+                    self.st.adjust_applied = None;
                     self.st.preview = Some(s);
                     self.st.permissions_missing = false;
                 }
@@ -760,6 +818,7 @@ impl App {
                 let _ = std::fs::write(record::pidfile_path(), record::pidfile_text(&sess.outputs));
                 self.st.pip_applied = Some(self.st.settings.pip_spec());
                 self.st.volumes_applied = Some(self.st.settings.volumes());
+                self.st.adjust_applied = None;
                 self.st.recording = Some(sess);
                 record::PAUSE_REQ.store(false, Ordering::SeqCst);
                 record::RESUME_REQ.store(false, Ordering::SeqCst);
@@ -940,6 +999,7 @@ impl App {
         self.sync_preview();
         self.st.apply_pip();
         self.st.apply_volumes();
+        self.st.apply_camera();
         let clock = self.st.clock();
         let view = menubar::View {
             recording: self.st.recording.is_some(),
@@ -1405,6 +1465,13 @@ impl SelfTest {
                 self.session_before = app.st.preview.as_ref().map(|s| s.started);
                 app.st.settings.pip_place = crate::compose::Place::At([0.3, 0.4]);
                 app.st.settings.pip_shape = crate::compose::Shape::Squircle;
+                // Warm the camera's picture: also live.
+                if let Some((_, name)) = app.st.camera_in_use.clone() {
+                    let mut look = app.st.settings.look(&name);
+                    look.adjust.temperature = 4000.0;
+                    look.adjust.sharpness = -1.0;
+                    app.st.settings.set_look(&name, look);
+                }
                 self.step = 6;
             }
             6 if t > 10.0 => {
@@ -1413,6 +1480,12 @@ impl SelfTest {
                     "selftest: overlay change live={} applied={}",
                     now.is_some() && now == self.session_before,
                     app.st.pip_applied.as_ref() == Some(&app.st.settings.pip_spec())
+                );
+                let look = app.st.camera_in_use.as_ref().map(|(_, name)| app.st.settings.look(name).adjust);
+                println!(
+                    "selftest: camera adjust live={} applied={}",
+                    now.is_some() && now == self.session_before,
+                    look.is_some_and(|a| !a.is_neutral() && app.st.adjust_applied == Some(a))
                 );
                 println!(
                     "selftest: settings window={} preview_restarted={}",

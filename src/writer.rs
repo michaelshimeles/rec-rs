@@ -724,6 +724,13 @@ impl Sink {
         }
     }
 
+    /// Change the camera's software adjustments live.
+    pub fn set_cam_adjust(&mut self, adjust: &crate::look::Adjust) {
+        if let Some(c) = self.compositor.as_mut() {
+            c.set_adjust(adjust);
+        }
+    }
+
     /// Aspect ratio of the camera, once frames arrive.
     pub fn cam_aspect(&self) -> Option<f64> {
         self.compositor.as_ref().map(|c| c.cam_aspect())

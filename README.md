@@ -149,6 +149,19 @@ The **main window** contains:
 
   While recording you can switch scenes live, provided the recording started with a camera
   scene.
+- **Camera adjustments** (with a camera scene), saved per camera:
+  - Resolution: 720p (the default) or 1080p, the camera's closest landscape format.
+  - Picture, applied by Rec: white balance in kelvin (5600 K keeps the camera's color, lower
+    is cooler, higher warmer) and tint, exposure in stops, brightness, contrast, saturation,
+    sharpness (below 0 softens) and noise reduction. They apply live, also while recording,
+    to the preview, the file and the stream alike. At their neutral values no filter runs.
+  - Lens, set on the camera itself over USB: zoom, roll, autofocus and manual focus, shown
+    only for the controls a USB (UVC) camera answers for. A DJI Osmo Pocket 3 has zoom (1x to
+    4x), roll and focus, but no white balance, exposure, shutter or ISO over USB.
+  - Guides for the preview only, never recorded or streamed: zebras over overexposed areas
+    (95% and up) and a rule-of-thirds grid.
+  - Presets: Osmo studio (5600K) and a 5000K version (sharpness -1, autofocus, zebras and
+    the grid on), and Reset.
 - **Sources**:
   - Display.
   - Entire display, or a single window.
@@ -200,8 +213,8 @@ The **settings window** (⌘, or the Settings… button) covers:
 - Frame rate, codec (auto, H.264, HEVC, ProRes) and bitrate.
 - Cursor and click highlighting.
 - Audio devices and track layout. Levels are set with the faders in the main window.
-- Camera device, plus the overlay: shape, roundness, size, border, shadow, corner presets and
-  mirroring.
+- Camera device and resolution (720p or 1080p), plus the overlay: shape, roundness, size,
+  border, shadow, corner presets and mirroring.
 - Live encode for the replay buffer and streams: resolution, video bitrate, CBR, keyframe
   interval and audio bitrate (locked while streaming).
 
@@ -266,6 +279,8 @@ frames, and pauses don't count.
 | `--mic DEVICE` / `--no-mic` | `default` | Unique ID or name substring. |
 | `-w, --cam, --webcam [DEVICE]` | off | `default` or ID or name. Turns on the Screen + Cam scene. |
 | `--scene` | `screen-cam` with a camera, else `screen` | `screen`, `screen-cam`, `cam`. |
+| `--cam-resolution` | `720p` | `720p` or `1080p`: the camera's closest landscape format at 30 fps. |
+| `--cam-adjust KEY=VALUE,...` | neutral | Adjust the camera picture: `temperature` (kelvin; 5600 keeps the color, lower is cooler), `tint` (−100 green to 100 magenta), `exposure` (stops, −2 to 2), `brightness`, `contrast`, `saturation` (−100 to 100), `sharpness` (−2 soft to 2 sharp), `noise` (noise reduction, 0 to 2). |
 | `--pip-size`, `--pip-corner`, `--pip-shape`, `--no-mirror` | `0.22`, bottom-right, rounded | Shape: `circle`, `rounded`, `square`, `pill`, `squircle` (or `rect`). |
 | `--pip-pos X,Y` | | Center the overlay anywhere, as fractions of the frame from the top-left (overrides `--pip-corner`). |
 | `--pip-roundness`, `--pip-border`, `--pip-border-color`, `--pip-shadow` | `0.2`, `0`, `ffffff`, off | Roundness 0–1; border width in pixels at 1080p; hex color; soft drop shadow. |
@@ -292,6 +307,8 @@ frames, and pauses don't count.
 Other commands:
 
 - `rec-rs devices` lists displays, windows, cameras and mics.
+- `rec-rs camera-controls [DEVICE] [--set zoom=200]` lists a USB camera's hardware controls
+  (zoom, roll, autofocus, focus) with their ranges, or sets them.
 - `rec-rs probe FILE` checks a file with AVFoundation, QuickTime's engine, and decodes every
   sample.
 - `rec-rs permissions [--request]` shows or requests the privacy grants.
@@ -375,7 +392,8 @@ rec-rs record --no-record --stream rtmp://localhost/live --stream http://localho
 - **Camera.** In the app the running camera passes from the preview to the recording and
   back, so a recording starts with the exposure already settled. A camera started cold (CLI)
   is given 2 s to settle before the file starts, so it never opens on black or dark frames.
-  Rec picks the camera's format itself: landscape, 30 fps, 1280x720 when the camera has it.
+  Rec picks the camera's format itself: landscape, 30 fps, 1280x720 (or 1920x1080 when set
+  to 1080p) when the camera has it.
   Some cameras still send black bars around the picture (a DJI Osmo Pocket 3 can put its
   16:9 picture in a portrait frame). Rec checks for bars twice a second and crops them once
   they hold for 1.5 s, so the overlay has the picture's shape. Dark scenes don't count as
@@ -503,6 +521,8 @@ the same time. Edit them apart later: move, resize or cut the camera in an edito
 | `src/writer.rs` | AVAssetWriter sink, constant-frame-rate grid, pause timeline, track layout |
 | `src/screen.rs` | ScreenCaptureKit capture, displays and windows |
 | `src/camera.rs` | Webcam (and its format) and AVCapture mic, device lists |
+| `src/look.rs` | Camera picture adjustments: white balance, exposure, color, sharpness and noise reduction in CoreImage |
+| `src/uvc.rs` | USB (UVC) camera controls through IOKit: zoom, roll, focus |
 | `src/bars.rs` | Black bars around a camera's picture: measuring them and deciding when to crop |
 | `src/compose.rs` | CoreImage scenes and webcam overlay |
 | `src/separate.rs` | Separate screen and camera files: naming, the camera file's size and picture |
@@ -512,6 +532,7 @@ the same time. Edit them apart later: move, resize or cut the camera in an edito
 | `src/probe.rs` | AVFoundation verification |
 | `src/synth.rs` | Test pattern with flash + beep, the generated test camera, and the time code both draw |
 | `src/scale.rs` | Native-resolution screen scaling (Metal Performance Shaders Lanczos, VideoToolbox fallback) |
+| `testdata/` | Test fixtures: a DJI Osmo Pocket 3's USB configuration descriptor |
 | `scripts/` | Build, self-test, soak, sync checks (`synccheck.py` with ffmpeg, `avsync.swift` with AVFoundation), level checks (`levelcheck.py`) and quality metrics (`quality.sh`, `encquality.sh`, `testcard.swift`) |
 | `site/` | Download page: SvelteKit, deployed to Vercel (see [site/README.md](site/README.md)) |
 | `AGENTS.md`, `.agents/skills/` | Agent workflow, checks and skills from [michaelshimeles/skills](https://github.com/michaelshimeles/skills); `.claude/skills/` links to the same skills |

@@ -4,6 +4,7 @@ mod camera;
 mod compose;
 mod hotkey;
 mod live;
+mod look;
 mod mixer;
 mod outlatency;
 mod play;
@@ -16,6 +17,7 @@ mod settings;
 mod synth;
 mod tcc;
 mod util;
+mod uvc;
 mod writer;
 
 use std::path::PathBuf;
@@ -87,6 +89,18 @@ enum Cmd {
     RequestScreen,
     /// Check a recording with AVFoundation (the engine QuickTime uses).
     Probe { file: PathBuf },
+    /// List a USB camera's hardware controls (zoom, roll, focus), or set
+    /// them: `--set zoom=200`.
+    CameraControls {
+        /// Camera unique ID or name substring (default: every camera).
+        device: Option<String>,
+        /// CONTROL=VALUE (zoom, roll, autofocus, focus); repeatable.
+        #[arg(long, value_name = "CONTROL=VALUE", allow_hyphen_values = true)]
+        set: Vec<String>,
+        /// Also print the configuration descriptor in hex.
+        #[arg(long)]
+        dump: bool,
+    },
     /// Play a file in an AVPlayer window (reference player for sync tests).
     #[command(hide = true)]
     Play {
@@ -158,6 +172,17 @@ pub struct RecordArgs {
     /// scene turns the webcam on.
     #[arg(long, value_enum)]
     scene: Option<compose::Scene>,
+    /// Webcam picture size to ask for (the camera's closest landscape
+    /// format at 30 fps).
+    #[arg(long, value_enum, default_value_t = camera::CamResolution::Hd720)]
+    cam_resolution: camera::CamResolution,
+    /// Adjust the webcam picture, as KEY=VALUE pairs separated by commas:
+    /// temperature (white balance in kelvin, 5600 leaves the color as is,
+    /// lower is cooler), tint (-100 green to 100 magenta), exposure (stops,
+    /// -2 to 2), brightness, contrast, saturation (-100 to 100), sharpness
+    /// (-2 soft to 2 sharp), noise (noise reduction, 0 to 2).
+    #[arg(long, value_name = "KEY=VALUE,...", allow_hyphen_values = true)]
+    cam_adjust: Option<String>,
     /// Webcam overlay width as a fraction of the frame width.
     #[arg(long, default_value_t = 0.22)]
     pip_size: f64,
@@ -434,6 +459,14 @@ pub fn prepare(a: RecordArgs) -> Result<(record::Options, Option<screen::Target>
         mic,
         mic_warning,
         webcam,
+        cam_resolution: a.cam_resolution,
+        cam_adjust: a
+            .cam_adjust
+            .as_deref()
+            .map(look::Adjust::parse)
+            .transpose()
+            .map_err(|e| anyhow::anyhow!("--cam-adjust: {e}"))?
+            .unwrap_or_default(),
         pip: PipSpec {
             size: a.pip_size.clamp(0.05, 0.9),
             place: match &a.pip_pos {
@@ -665,6 +698,7 @@ fn main() {
     let r = match cli.cmd.unwrap_or(Cmd::Gui { start_recording: false, settings: false, window: None }) {
         Cmd::Gui { start_recording, settings, window } => app::run(start_recording, settings, window),
         Cmd::Record(a) => record(a),
+        Cmd::CameraControls { device, set, dump } => uvc::cli(device.as_deref(), &set, dump),
         Cmd::Devices => {
             let r = devices();
             if let Some(l) = outlatency::output_latency() {

@@ -19,6 +19,7 @@ pub enum Icon {
     Scene,
     Display,
     Camera,
+    Adjust,
     Overlay,
     Audio,
     Output,
@@ -110,6 +111,32 @@ pub fn slot(ui: &mut Ui, width: f32, align: Align, text: egui::RichText) {
     ui.allocate_ui_with_layout(vec2(width, ROW_H), layout, |ui| {
         ui.set_min_size(vec2(width, ROW_H));
         ui.add(egui::Label::new(text).truncate());
+    });
+}
+
+/// A small rounded label after a heading: who applies a group of
+/// settings ("Rec" or "Camera"). Hover for `tip`.
+pub fn tag(ui: &mut Ui, text: &str, accent: bool, tip: &str) -> Response {
+    let p = theme::pal(ui);
+    let (fg, fill) = if accent { (theme::accent(), theme::accent().gamma_multiply(0.16)) } else { (p.secondary, p.control) };
+    let font = theme::semibold(SECONDARY - 1.0);
+    let galley = ui.painter().layout_no_wrap(text.to_string(), font, fg);
+    let (rect, resp) = ui.allocate_exact_size(galley.size() + vec2(10.0, 4.0), Sense::hover());
+    ui.painter().rect_filled(rect, CornerRadius::same(5), fill);
+    ui.painter().galley(rect.center() - galley.size() / 2.0, galley, fg);
+    resp.on_hover_text(tip)
+}
+
+/// A group title inside a card, with an optional `tag` on the right.
+pub fn subhead(ui: &mut Ui, title: &str, tag_: Option<(&str, bool, &str)>) {
+    let p = theme::pal(ui);
+    let w = ui.available_width();
+    ui.allocate_ui_with_layout(vec2(w, 22.0), Layout::left_to_right(Align::Center), |ui| {
+        ui.set_min_size(vec2(w, 22.0));
+        ui.label(egui::RichText::new(title).font(theme::semibold(SECONDARY + 1.0)).color(p.text));
+        if let Some((text, accent, tip)) = tag_ {
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| tag(ui, text, accent, tip));
+        }
     });
 }
 
@@ -363,6 +390,13 @@ pub fn paint_icon(ui: &Ui, rect: Rect, icon: Icon, color: Color32) {
         Icon::Camera => {
             outline(Rect::from_min_max(at(1.0, 4.0), at(9.5, 11.0)), r2);
             painter.add(Shape::convex_polygon(vec![at(10.0, 7.5), at(13.0, 5.0), at(13.0, 10.0)], Color32::TRANSPARENT, s));
+        }
+        Icon::Adjust => {
+            // Three slider tracks with their knobs.
+            for (y, x) in [(3.0, 9.5), (7.0, 4.5), (11.0, 8.0)] {
+                painter.line_segment([at(1.0, y), at(13.0, y)], s);
+                painter.circle_filled(at(x, y), 1.9, color);
+            }
         }
         Icon::Overlay => {
             outline(Rect::from_min_max(at(1.0, 2.0), at(13.0, 12.0)), r2);

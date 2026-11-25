@@ -15,6 +15,11 @@
 //!
 //! Steps 1 and 2 run on a worker thread (they wait for the GPU); the UI
 //! thread only wraps the result. Low power: half the resolution at 15 fps.
+//!
+//! Zebras (stripes over the camera's overexposed areas) are drawn here, on
+//! the worker's own copy of the frame after scaling, so they are preview
+//! only: the session hands the same frame to the file and the live encode
+//! untouched. The rule-of-thirds grid is drawn by the UI over the preview.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -27,6 +32,7 @@ use objc2_core_video::*;
 use objc2_metal::*;
 use objc2_video_toolbox::*;
 
+use crate::compose::Shape;
 use crate::scale::FrameScaler;
 use crate::util::*;
 use crate::writer::PreviewFn;
@@ -42,6 +48,31 @@ static LOW_POWER: AtomicBool = AtomicBool::new(false);
 static SKIP: AtomicBool = AtomicBool::new(false);
 /// Preview area in pixels (width << 32 | height); 0 = unknown.
 static TARGET: AtomicU64 = AtomicU64::new(0);
+static ZEBRAS: Mutex<Option<Zebras>> = Mutex::new(None);
+
+/// Where the camera is in the frame, for zebras.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Zebras {
+    /// [x, y, width, height] as fractions of the frame from its top-left.
+    pub rect: [f64; 4],
+    /// The overlay's shape there (a rectangle for the full-frame camera).
+    pub shape: Shape,
+    pub roundness: f64,
+    /// The overlay's border, in pixels at 1080p: it isn't camera picture.
+    pub border: f64,
+}
+
+/// Luma (0 to 1, Rec. 709 weights on the encoded values) from which a
+/// pixel counts as overexposed: 95%, as camera zebras usually start.
+pub const ZEBRA_LEVEL: f64 = 0.95;
+
+/// Draw zebras over the camera's part of the preview, or stop (None).
+pub fn set_zebras(z: Option<Zebras>) {
+    let mut cur = ZEBRAS.lock().unwrap();
+    if *cur != z {
+        *cur = z;
+    }
+}
 
 /// Whether frames are wanted (main window visible).
 pub fn set_wanted(on: bool) {
@@ -79,7 +110,14 @@ pub fn callback(wake: Arc<dyn Fn() + Send + Sync>) -> PreviewFn {
                         f.take().unwrap()
                     };
                     let t = TARGET.load(Ordering::Relaxed);
-                    let out = objc2::rc::autoreleasepool(|_| w.scaled_bgra(&frame.0, ((t >> 32) as u32, t as u32), LOW_POWER.load(Ordering::Relaxed)));
+                    let zebras = ZEBRAS.lock().unwrap().clone();
+                    let out = objc2::rc::autoreleasepool(|_| {
+                        let img = w.scaled_bgra(&frame.0, ((t >> 32) as u32, t as u32), LOW_POWER.load(Ordering::Relaxed))?;
+                        match &zebras {
+                            Some(z) => w.zebras(&img, z).or(Some(img)),
+                            None => Some(img),
+                        }
+                    });
                     if let Some(out) = out
                         && WANTED.load(Ordering::Relaxed)
                     {
@@ -153,13 +191,21 @@ impl Scaler {
     }
 }
 
-/// The worker side: GPU scaling and color conversion.
+/// The worker side: GPU scaling and color conversion, and zebras.
 struct Worker {
     scaler: Option<((usize, usize), FrameScaler)>,
     scaled_pool: Option<((usize, usize, u32), Pool)>,
     bgra_pool: Option<((usize, usize), Pool)>,
     to_bgra: CFRetained<VTPixelTransferSession>,
+    /// A CoreImage context without color management, so pixels away from
+    /// the zebras come out exactly as they went in.
+    zebra_ctx: Option<Retained<objc2_core_image::CIContext>>,
+    zebra_pool: Option<((usize, usize), Pool)>,
+    /// The overlay's shape at its size in the preview, as a mask.
+    zebra_mask: Option<(ZebraMaskKey, Retained<objc2_core_image::CIImage>)>,
 }
+
+type ZebraMaskKey = (usize, usize, Shape, u64, u64);
 
 fn new_buffer(pool: &CVPixelBufferPool) -> Option<CFRetained<CVPixelBuffer>> {
     let mut b = std::ptr::null_mut();
@@ -179,7 +225,101 @@ impl Worker {
             VTSessionSetProperty(s.as_ref(), key, Some(kCVImageBufferYCbCrMatrix_ITU_R_709_2.as_ref() as &CFType));
             s
         };
-        Worker { scaler: None, scaled_pool: None, bgra_pool: None, to_bgra }
+        Worker { scaler: None, scaled_pool: None, bgra_pool: None, to_bgra, zebra_ctx: None, zebra_pool: None, zebra_mask: None }
+    }
+
+    /// Step 3 (zebras on): a copy of the BGRA preview frame `src` with
+    /// diagonal stripes over the overexposed pixels of the camera's part.
+    fn zebras(&mut self, src: &CVPixelBuffer, z: &Zebras) -> Option<CFRetained<CVPixelBuffer>> {
+        use objc2_core_foundation::{CGAffineTransform, CGPoint, CGRect, CGSize};
+        use objc2_core_image::{CIColor, CIContext, CIImage, CIVector, kCIContextWorkingColorSpace};
+        let (w, h) = (CVPixelBufferGetWidth(src), CVPixelBufferGetHeight(src));
+        if CVPixelBufferGetPixelFormatType(src) != PIX_BGRA || w == 0 || h == 0 {
+            return None;
+        }
+        let (fw, fh) = (w as f64, h as f64);
+        // The camera's rectangle in pixels, CoreImage style (from the bottom).
+        let [x, y, rw, rh] = z.rect;
+        let (px, pw, ph) = ((x * fw).round(), (rw * fw).round(), (rh * fh).round());
+        let py = fh - (y * fh).round() - ph;
+        if pw < 2.0 || ph < 2.0 {
+            return None;
+        }
+        let rect = |x: f64, y: f64, w: f64, h: f64| CGRect::new(CGPoint::new(x, y), CGSize::new(w, h));
+        unsafe {
+            let ctx = self
+                .zebra_ctx
+                .get_or_insert_with(|| {
+                    CIContext::contextWithOptions(Some(&dict(vec![(kCIContextWorkingColorSpace, obj(&*objc2_foundation::NSNull::null()))])))
+                })
+                .clone();
+            let canvas = rect(0.0, 0.0, fw, fh);
+            let frame = CIImage::imageWithCVPixelBuffer(src);
+            let vec4 = |a: f64, b: f64, c: f64, d: f64| obj(&*CIVector::vectorWithX_Y_Z_W(a, b, c, d));
+            // Luma ramped from 0 to 1 over the 2% above the level.
+            let k = 50.0;
+            let l = |c: f64| c * k;
+            let luma = vec4(l(0.2126), l(0.7152), l(0.0722), 0.0);
+            let bias = -ZEBRA_LEVEL * k;
+            let over = frame
+                .imageByApplyingFilter_withInputParameters(
+                    &ns("CIColorMatrix"),
+                    &dict(vec![
+                        (&*ns("inputRVector"), luma.clone()),
+                        (&*ns("inputGVector"), luma.clone()),
+                        (&*ns("inputBVector"), luma),
+                        (&*ns("inputAVector"), vec4(0.0, 0.0, 0.0, 0.0)),
+                        (&*ns("inputBiasVector"), vec4(bias, bias, bias, 1.0)),
+                    ]),
+                )
+                .imageByApplyingFilter_withInputParameters(&ns("CIColorClamp"), &dict(vec![]))
+                .imageByCroppingToRect(rect(px, py, pw, ph));
+            // Only where the overlay shows the camera: inside its shape and
+            // border. The full-frame camera is a plain rectangle.
+            let inset = crate::compose::border_px(&crate::compose::PipSpec { border: z.border, ..Default::default() }, fh);
+            let black = CIImage::imageWithColor(&CIColor::colorWithRed_green_blue(0.0, 0.0, 0.0)).imageByCroppingToRect(canvas);
+            let mask = if z.shape == Shape::Rect && inset == 0.0 {
+                over
+            } else {
+                let key = (pw as usize, ph as usize, z.shape, z.roundness.to_bits(), inset.to_bits());
+                if self.zebra_mask.as_ref().is_none_or(|(k, _)| *k != key) {
+                    let alpha = crate::compose::mask(z.shape, key.0, key.1, z.roundness, inset);
+                    self.zebra_mask = Some((key, crate::compose::alpha_image(&alpha, key.0, key.1, [255, 255, 255])));
+                }
+                let shape = &self.zebra_mask.as_ref()?.1;
+                let placed = shape.imageByApplyingTransform(CGAffineTransform { a: 1.0, b: 0.0, c: 0.0, d: 1.0, tx: px, ty: py });
+                over.imageByApplyingFilter_withInputParameters(
+                    &ns("CIBlendWithMask"),
+                    &dict(vec![(&*ns("inputBackgroundImage"), obj(&*black)), (&*ns("inputMaskImage"), obj(&*placed))]),
+                )
+            };
+            // Dark diagonal stripes, about 1/90 of the frame's height wide.
+            let stripes = objc2_core_image::CIFilter::filterWithName_withInputParameters(
+                &ns("CIStripesGenerator"),
+                Some(&dict(vec![
+                    (&*ns("inputColor0"), obj(&*CIColor::colorWithRed_green_blue_alpha(0.0, 0.0, 0.0, 0.85))),
+                    (&*ns("inputColor1"), obj(&*CIColor::colorWithRed_green_blue_alpha(0.0, 0.0, 0.0, 0.0))),
+                    (&*ns("inputWidth"), num_f((fh / 90.0).round().max(3.0))),
+                    (&*ns("inputSharpness"), num_f(1.0)),
+                ])),
+            )?
+            .outputImage()?;
+            let (c, s) = (std::f64::consts::FRAC_PI_4.cos(), std::f64::consts::FRAC_PI_4.sin());
+            let striped = stripes
+                .imageByApplyingTransform(CGAffineTransform { a: c, b: s, c: -s, d: c, tx: 0.0, ty: 0.0 })
+                .imageByCroppingToRect(canvas)
+                .imageByCompositingOverImage(&frame);
+            let out_img = striped.imageByApplyingFilter_withInputParameters(
+                &ns("CIBlendWithMask"),
+                &dict(vec![(&*ns("inputBackgroundImage"), obj(&*frame)), (&*ns("inputMaskImage"), obj(&*mask))]),
+            );
+            if self.zebra_pool.as_ref().is_none_or(|(k, _)| *k != (w, h)) {
+                self.zebra_pool = Some(((w, h), SendBox(make_pool(w, h, PIX_BGRA))));
+            }
+            let out = new_buffer(&self.zebra_pool.as_ref()?.1.0)?;
+            ctx.render_toCVPixelBuffer_bounds_colorSpace(&out_img, &out, canvas, None);
+            Some(out)
+        }
     }
 
     /// Steps 1 and 2: `src` as BGRA at its preview size for `area`.
@@ -381,6 +521,107 @@ mod tests {
     fn preview_texture_is_not_srgb() {
         assert!(!TEXTURE_FORMAT.is_srgb());
         assert_eq!(MTL_FORMAT, MTLPixelFormat::BGRA8Unorm);
+    }
+
+    fn bgra(w: usize, h: usize, f: impl Fn(usize, usize) -> [u8; 4]) -> CFRetained<CVPixelBuffer> {
+        let pool = make_pool(w, h, PIX_BGRA);
+        let b = new_buffer(&pool).unwrap();
+        unsafe {
+            CVPixelBufferLockBaseAddress(&b, CVPixelBufferLockFlags(0));
+            let base = CVPixelBufferGetBaseAddress(&b) as *mut u8;
+            let stride = CVPixelBufferGetBytesPerRow(&b);
+            for y in 0..h {
+                for x in 0..w {
+                    std::ptr::copy_nonoverlapping(f(x, y).as_ptr(), base.add(y * stride + x * 4), 4);
+                }
+            }
+            CVPixelBufferUnlockBaseAddress(&b, CVPixelBufferLockFlags(0));
+        }
+        b
+    }
+
+    fn px(b: &CVPixelBuffer, x: usize, y: usize) -> [u8; 4] {
+        unsafe {
+            CVPixelBufferLockBaseAddress(b, CVPixelBufferLockFlags::ReadOnly);
+            let p = (CVPixelBufferGetBaseAddress(b) as *const u8).add(y * CVPixelBufferGetBytesPerRow(b) + x * 4);
+            let v = [*p, *p.add(1), *p.add(2), *p.add(3)];
+            CVPixelBufferUnlockBaseAddress(b, CVPixelBufferLockFlags::ReadOnly);
+            v
+        }
+    }
+
+    /// Zebras mark overexposed camera pixels in the preview's copy, leave
+    /// every other pixel exactly as it was, and never touch the frame the
+    /// session handed over (which the file and the live encode share).
+    #[test]
+    fn zebras_mark_overexposure_in_the_preview_only() {
+        let (w, h) = (320, 180);
+        // Left half blown out (white), right half mid gray; a red patch.
+        let frame = bgra(w, h, |x, y| match (x, y) {
+            (x, _) if x < w / 2 => [255, 255, 255, 255],
+            (x, y) if x > 280 && y < 20 => [0, 0, 255, 255],
+            _ => [128, 128, 128, 255],
+        });
+        let before = (0..h).flat_map(|y| (0..w).map(move |x| (x, y))).map(|(x, y)| px(&frame, x, y)).collect::<Vec<_>>();
+        let mut worker = Worker::new();
+        let full = Zebras { rect: [0.0, 0.0, 1.0, 1.0], shape: Shape::Rect, roundness: 0.0, border: 0.0 };
+        let out = worker.zebras(&frame, &full).unwrap();
+        let dark_in_white = (0..w / 2).flat_map(|x| (0..h).map(move |y| (x, y))).filter(|&(x, y)| px(&out, x, y)[1] < 100).count();
+        assert!(dark_in_white > (w / 2 * h) / 5, "stripes over the white half: {dark_in_white} dark pixels");
+        for y in 0..h {
+            for x in w / 2..w {
+                assert_eq!(px(&out, x, y), px(&frame, x, y), "({x}, {y}) is not overexposed and must not change");
+            }
+        }
+        let after = (0..h).flat_map(|y| (0..w).map(move |x| (x, y))).map(|(x, y)| px(&frame, x, y)).collect::<Vec<_>>();
+        assert!(before == after, "the session's frame is untouched");
+        // Only the camera's part: an overlay in the right half (all gray)
+        // leaves the white half alone.
+        let overlay = Zebras { rect: [0.6, 0.2, 0.3, 0.5], shape: Shape::Circle, roundness: 0.0, border: 8.0 };
+        let out = worker.zebras(&frame, &overlay).unwrap();
+        for (x, y) in [(10, 10), (80, 90), (150, 170)] {
+            assert_eq!(px(&out, x, y), [255, 255, 255, 255], "outside the overlay ({x}, {y})");
+        }
+        // With REC_EVIDENCE_DIR: a gray ramp to white with a white disc, then
+        // zebras over the whole frame and over a circular overlay.
+        let (w, h) = (640, 360);
+        let ramp = bgra(w, h, |x, y| {
+            let (dx, dy) = (x as f64 - 470.0, y as f64 - 180.0);
+            let v = if dx * dx + dy * dy < 70.0 * 70.0 { 255 } else { (x * 255 / (w - 1)) as u8 };
+            [v, v, v, 255]
+        });
+        crate::compose::tests::save_png(&ramp, "zebras-input");
+        crate::compose::tests::save_png(&worker.zebras(&ramp, &full).unwrap(), "zebras-full-frame");
+        let circle = Zebras { rect: [0.55, 0.15, 0.4, 0.7], shape: Shape::Circle, roundness: 0.0, border: 0.0 };
+        crate::compose::tests::save_png(&worker.zebras(&ramp, &circle).unwrap(), "zebras-circle-overlay");
+    }
+
+    /// What zebras cost the preview worker on a large preview (2780x1564
+    /// px) with half of it overexposed (run with --ignored --nocapture,
+    /// in release).
+    #[test]
+    #[ignore]
+    fn zebra_cost() {
+        let (w, h) = (2780, 1564);
+        let frame = bgra(w, h, |x, y| if x < w / 2 { [255, 255, 255, 255] } else { [(y % 256) as u8, 128, 90, 255] });
+        let mut worker = Worker::new();
+        for (name, z) in [
+            ("full-frame camera", Zebras { rect: [0.0, 0.0, 1.0, 1.0], shape: Shape::Rect, roundness: 0.0, border: 0.0 }),
+            ("rounded overlay", Zebras { rect: [0.7, 0.6, 0.25, 0.3], shape: Shape::Rounded, roundness: 0.2, border: 4.0 }),
+        ] {
+            for _ in 0..10 {
+                objc2::rc::autoreleasepool(|_| worker.zebras(&frame, &z));
+            }
+            let (t, c) = (std::time::Instant::now(), cpu());
+            for _ in 0..120 {
+                objc2::rc::autoreleasepool(|_| worker.zebras(&frame, &z));
+            }
+            println!(
+                "zebras, {name}, {w}x{h}: {:.2} ms/frame wall, {:.2} ms CPU",
+                t.elapsed().as_secs_f64() * 1000.0 / 120.0,
+                (cpu() - c) * 1000.0 / 120.0
+            );
+        }
     }
 
     #[test]

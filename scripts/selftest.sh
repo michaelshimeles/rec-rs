@@ -247,6 +247,7 @@ elif [ "${1:-}" != "--no-screen" ]; then
      && grep -q 'paused=true' "$OUT/gui.log" \
      && grep -q 'settings window=true' "$OUT/gui.log" \
      && grep -q 'overlay change live=true applied=true' "$OUT/gui.log" \
+     && grep -q 'camera adjust live=true applied=true' "$OUT/gui.log" \
      && f=$(sed -n 's/.*saved=Some("\(.*\)").*/\1/p' "$OUT/gui.log") && [ -n "$f" ] \
      && "$REC" probe "$f" >"$OUT/gui.probe" 2>&1 \
      && python3 - "$OUT/gui.log" "$f" <<'PY'
@@ -262,7 +263,7 @@ print(f"pause check: file {dur:.2f}s, recorded clock {rec:.2f}s, wall {wall:.2f}
 sys.exit(0 if ok else 1)
 PY
   then
-    echo "PASS  gui-app  (preview, record, pause, saved and probed, pause cut from file, settings window, live overlay change)"; pass=$((pass+1))
+    echo "PASS  gui-app  (preview, record, pause, saved and probed, pause cut from file, settings window, live overlay and camera changes)"; pass=$((pass+1))
   else
     echo "FAIL  gui-app  (see $OUT/gui.log)"; fail=$((fail+1))
   fi
