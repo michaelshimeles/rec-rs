@@ -78,6 +78,9 @@ pub struct Settings {
     pub output_dir: PathBuf,
     /// "mov" or "mp4".
     pub container: String,
+    /// The composed video, the screen and the camera as separate files, or
+    /// both. Separate files need a camera scene.
+    pub files: crate::separate::Files,
     /// None = automatic (H.264 up to 1080p, HEVC above).
     pub codec: Option<Codec>,
     pub resolution: String,
@@ -147,6 +150,7 @@ impl Default for Settings {
         Settings {
             output_dir: default_output_dir(),
             container: "mov".into(),
+            files: crate::separate::Files::Composed,
             codec: None,
             resolution: "1080p".into(),
             fps: 60,
@@ -330,6 +334,8 @@ impl Settings {
             mirror: d.mirror,
             camera_looks: d.camera_looks.clone(),
             preview_low_power: d.preview_low_power,
+            // Only recordings write files; the preview is the same.
+            files: d.files,
             replay_enabled: d.replay_enabled,
             replay_secs: d.replay_secs,
             stream_dests: d.stream_dests.clone(),
@@ -404,6 +410,12 @@ impl Settings {
         }
         if let Some(o) = output {
             a.extend(["-o".into(), o.to_string_lossy().into_owned()]);
+        }
+        if self.scene.uses_cam() && self.files.separate() {
+            a.push("--separate".into());
+            if self.files.composed() {
+                a.push("--composed".into());
+            }
         }
         a.extend(["--scene".into(), value(self.scene)]);
         if self.scene.uses_cam() {
@@ -714,6 +726,42 @@ mod tests {
         // No camera, no camera arguments.
         let args = Settings::default().record_args(None);
         assert!(!args.iter().any(|a| a == "--cam-resolution"));
+    }
+
+    #[test]
+    fn files_setting_is_saved_and_older_files_keep_one_video() {
+        use crate::separate::Files;
+        // Settings saved before the option load with the composed video only.
+        let old = Settings::from_json(r#"{"scene": "screen-cam", "fps": 30}"#).unwrap();
+        assert_eq!(old.files, Files::Composed);
+        assert_eq!(old.fps, 30);
+        assert!(!old.record_args(None).contains(&"--separate".to_string()));
+        for files in [Files::Composed, Files::Separate, Files::Both] {
+            let s = Settings { files, ..Default::default() };
+            let json = serde_json::to_string(&s).unwrap();
+            assert_eq!(Settings::from_json(&json).unwrap().files, files, "{json}");
+        }
+        let json = serde_json::to_string(&Settings { files: Files::Both, ..Default::default() }).unwrap();
+        assert!(json.contains(r#""files":"both""#), "{json}");
+    }
+
+    #[test]
+    fn separate_files_reach_the_cli_with_a_camera_scene() {
+        use crate::separate::Files;
+        let parse = |s: &Settings| {
+            let args = s.record_args(Some(std::path::Path::new("/tmp/x.mov")));
+            let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+            let a = crate::parse_record_args(&refs).unwrap();
+            (a.separate, a.composed)
+        };
+        let s = Settings { scene: Scene::ScreenCam, files: Files::Separate, ..Default::default() };
+        assert_eq!(parse(&s), (true, false));
+        assert_eq!(parse(&Settings { files: Files::Both, ..s.clone() }), (true, true));
+        assert_eq!(parse(&Settings { scene: Scene::Cam, ..s.clone() }), (true, false));
+        // The Screen scene has no camera: one video, as before.
+        assert_eq!(parse(&Settings { scene: Scene::Screen, ..s.clone() }), (false, false));
+        // Changing it restarts nothing (the preview is the same).
+        assert_eq!(s.capture_key(), Settings { files: Files::Composed, ..s.clone() }.capture_key());
     }
 
     #[test]

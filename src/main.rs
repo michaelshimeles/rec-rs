@@ -12,6 +12,7 @@ mod probe;
 mod record;
 mod scale;
 mod screen;
+mod separate;
 mod settings;
 mod synth;
 mod tcc;
@@ -244,6 +245,17 @@ pub struct RecordArgs {
     /// Do not write a recording file (replay buffer / streaming only).
     #[arg(long)]
     no_record: bool,
+    /// Write the screen and the camera to two files of their own, in sync,
+    /// to edit apart later: NAME-screen.mov (the screen, at the output size,
+    /// with every audio track) and NAME-camera.mov (the camera's picture
+    /// without black bars, with the mix). They start and stop together,
+    /// with the same frames. Replaces the composed video unless --composed.
+    /// Turns the webcam on.
+    #[arg(long)]
+    separate: bool,
+    /// With --separate: also write the composed video (the scene) to NAME.mov.
+    #[arg(long, requires = "separate")]
+    composed: bool,
     /// Live encode (replay and streams) size.
     #[arg(long, default_value = "1080p")]
     live_resolution: String,
@@ -287,6 +299,13 @@ pub struct RecordArgs {
     /// With --test-pattern: add random noise blocks to stress the encoder.
     #[arg(long, requires = "test_pattern")]
     noise: bool,
+    /// A generated camera instead of a webcam (self-test; needs no Camera
+    /// permission): 1280x720 at 30 fps, flashing white with the test
+    /// pattern. `letterbox` sends a 720x1280 frame with a 16:9 picture and
+    /// black bars, like a DJI Osmo Pocket 3 on a portrait format. Turns the
+    /// webcam on.
+    #[arg(long, value_name = "KIND", num_args = 0..=1, require_equals = true, default_missing_value = "plain", value_parser = ["plain", "letterbox"])]
+    test_camera: Option<String>,
 }
 
 fn even(x: f64) -> usize {
@@ -421,6 +440,10 @@ pub fn prepare(a: RecordArgs) -> Result<(record::Options, Option<screen::Target>
         }))
     };
     let mut webcam = a.webcam.map(|s| if s.is_empty() || s == "default" { None } else { Some(s) });
+    // Separate files and the test camera need the camera.
+    if (a.separate || a.test_camera.is_some()) && webcam.is_none() {
+        webcam = Some(None);
+    }
     let scene = a.scene.unwrap_or(if webcam.is_some() { compose::Scene::ScreenCam } else { compose::Scene::Screen });
     if scene.uses_cam() && webcam.is_none() {
         webcam = Some(None);
@@ -462,6 +485,8 @@ pub fn prepare(a: RecordArgs) -> Result<(record::Options, Option<screen::Target>
         duration: a.duration,
         quiet: a.quiet,
         test_pattern: a.test_pattern.then_some(a.noise),
+        files: separate::Files::from_flags(a.separate, a.composed),
+        test_camera: a.test_camera.as_deref().map(|k| k == "letterbox"),
         audio_layout: a.audio_tracks,
         volumes: [a.system_gain, a.mic_gain].map(|db| mixer::Volume { db, muted: false }),
         mic_backend: if a.test_pattern { record::MicBackend::Avcapture } else { a.mic_backend },
@@ -507,17 +532,10 @@ pub fn prepare(a: RecordArgs) -> Result<(record::Options, Option<screen::Target>
     };
     let (w, h) = parse_size(&a.resolution, native)?;
     let codec = a.codec.unwrap_or(if w * h > 1920 * 1080 { Codec::Hevc } else { Codec::H264 });
-    // Bits per pixel per frame tuned for screen content (sharp text).
-    let bpp = match codec {
-        Codec::H264 => 0.16,
-        Codec::Hevc => 0.10,
-        Codec::Prores => 0.0, // fixed quality; bitrate unused
-    };
     let bitrate = a
         .bitrate
-        .map(|m| (m * 1e6) as u64)
-        .unwrap_or_else(|| ((w * h) as f64 * a.fps as f64 * bpp) as u64)
-        .clamp(1_000_000, 400_000_000);
+        .map(|m| ((m * 1e6) as u64).clamp(1_000_000, 400_000_000))
+        .unwrap_or_else(|| writer::auto_bitrate(codec, w, h, a.fps));
     if codec == Codec::Prores && opts.output.extension().is_some_and(|e| e == "mp4") {
         bail!("ProRes needs a .mov output");
     }
@@ -582,7 +600,7 @@ pub fn parse_record_args(args: &[&str]) -> Result<RecordArgs> {
 
 fn record(a: RecordArgs) -> Result<()> {
     let (opts, target) = prepare(a)?;
-    let out = opts.output.clone();
+    let files = separate::outputs(&opts.output, opts.files);
     let quiet = opts.quiet;
     let wrote = opts.write;
     let stats = record::run(opts, target)?;
@@ -593,9 +611,10 @@ fn record(a: RecordArgs) -> Result<()> {
         return Ok(());
     }
     if !quiet {
+        let names: Vec<String> = files.iter().map(|f| f.display().to_string()).collect();
         eprintln!(
             "rec: saved {} ({} video frames, {} duplicated, {} dropped; audio buffers sys {} mic {} mix {}, {} dropped, {} clipped samples)",
-            out.display(),
+            names.join(", "),
             stats.video_frames_out,
             stats.video_dups,
             stats.video_drops,
@@ -605,13 +624,20 @@ fn record(a: RecordArgs) -> Result<()> {
             stats.audio_drops,
             stats.audio_clipped_samples
         );
+        if files.len() > 1 {
+            eprintln!(
+                "rec: separate files: screen {} frames, camera {} frames, {} dropped",
+                stats.separate_frames[0], stats.separate_frames[1], stats.separate_drops
+            );
+        }
     }
     if std::env::var_os("REC_DEBUG").is_some() {
         let avg = |sum: f64, n: u64| if n == 0 { 0.0 } else { sum / n as f64 * 1000.0 };
         eprintln!(
-            "rec: debug: encoder busy retries {}, audio gaps filled {}",
+            "rec: debug: encoder busy retries {}, audio gaps filled {}, longest pacer pass {:.1} ms",
             stats.video_retries,
-            stats.audio_gaps_filled
+            stats.audio_gaps_filled,
+            stats.pacer_max * 1000.0
         );
         eprintln!(
             "rec: debug: frame arrival latency  screen avg {:.1} ms max {:.1} ms ({} frames)  camera avg {:.1} ms max {:.1} ms ({} frames)",
@@ -623,7 +649,9 @@ fn record(a: RecordArgs) -> Result<()> {
             stats.cam_frames_in
         );
     }
-    println!("{}", out.display());
+    for f in &files {
+        println!("{}", f.display());
+    }
     Ok(())
 }
 
@@ -767,6 +795,22 @@ mod tests {
         for s in ["circle", "rounded", "square", "pill", "squircle", "rect"] {
             assert!(parse_record_args(&["--pip-shape", s]).is_ok(), "{s}");
         }
+    }
+
+    #[test]
+    fn separate_options() {
+        let a = parse_record_args(&["--separate", "-o", "talk.mov"]).unwrap();
+        assert!(a.separate && !a.composed);
+        assert_eq!(separate::Files::from_flags(a.separate, a.composed), separate::Files::Separate);
+        let a = parse_record_args(&["--separate", "--composed"]).unwrap();
+        assert!(a.separate && a.composed);
+        assert!(parse_record_args(&["--composed"]).is_err(), "--composed needs --separate");
+        assert_eq!(parse_record_args(&["--test-camera"]).unwrap().test_camera.as_deref(), Some("plain"));
+        assert_eq!(parse_record_args(&["--test-camera=letterbox"]).unwrap().test_camera.as_deref(), Some("letterbox"));
+        assert!(parse_record_args(&["--test-camera=nope"]).is_err());
+        // The flag doesn't swallow the next argument.
+        let a = parse_record_args(&["--test-camera", "--separate"]).unwrap();
+        assert!(a.separate && a.test_camera.is_some());
     }
 
     #[test]

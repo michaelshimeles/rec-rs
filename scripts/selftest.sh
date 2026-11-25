@@ -52,6 +52,49 @@ if scripts/synccheck.py "$OUT/pause.mov" --max-ms 1 >"$OUT/pause.check" 2>&1 \
 else
   echo "FAIL  pause-resume  (see $OUT/pause.check)"; fail=$((fail+1))
 fi
+# Separate files: the screen and a generated camera (no Camera permission
+# needed) in files of their own. Same frames and start, in sync: the test
+# pattern and the test camera draw their capture time on every frame and
+# scripts/trackcheck.py reads it back from both files.
+separate() {
+  name=$1; frames=$2; want=$3; shift 3
+  base="$OUT/$name.mov"
+  if "$REC" record -q --test-pattern --no-mic --separate -o "$base" "$@" >/dev/null 2>"$OUT/$name.log" \
+     && "$REC" probe "$OUT/$name-screen.mov" >"$OUT/$name.probe" 2>&1 \
+     && "$REC" probe "$OUT/$name-camera.mov" >>"$OUT/$name.probe" 2>&1 \
+     && scripts/trackcheck.py "$OUT/$name-screen.mov" "$OUT/$name-camera.mov" --frames "$frames" --window 2 >"$OUT/$name.check" 2>&1 \
+     && size=$(ffprobe -v error -select_streams v -show_entries stream=width,height -of csv=s=x:p=0 "$OUT/$name-camera.mov") \
+     && [ "$size" = "$want" ] \
+     && { case " $* " in *" --composed "*) "$REC" probe "$base" >>"$OUT/$name.probe" 2>&1 ;; *) [ ! -e "$base" ] ;; esac; }; then
+    echo "PASS  $name  ($frames frames in each file, camera $size, $(grep -m1 'whole take' "$OUT/$name.check" | sed 's/.*take: //;s/,.*//'))"; pass=$((pass+1))
+  else
+    echo "FAIL  $name  (see $OUT/$name.log, .probe, .check)"; fail=$((fail+1))
+  fi
+}
+separate separate 300 1280x720 --test-camera -t 5
+separate separate-letterbox 240 720x400 --test-camera=letterbox --composed -t 4
+separate separate-1080p 180 1920x1080 --test-camera --cam-resolution 1080p -t 3
+"$REC" record -q --test-pattern --no-mic --test-camera --separate -t 5 -o "$OUT/sep-pause.mov" >/dev/null 2>"$OUT/sep-pause.log" &
+sleep 2.3; "$REC" pause || true; sleep 2; "$REC" resume || true; wait || true
+if scripts/trackcheck.py "$OUT/sep-pause-screen.mov" "$OUT/sep-pause-camera.mov" --frames 300 --window 1 >"$OUT/sep-pause.check" 2>&1 \
+   && grep -q "pause cut" "$OUT/sep-pause.check"; then
+  echo "PASS  separate-pause  (300 frames in each file, the same pause cut from both)"; pass=$((pass+1))
+else
+  echo "FAIL  separate-pause  (see $OUT/sep-pause.check)"; fail=$((fail+1))
+fi
+# The app with Separate files on: one recording writes both files.
+mkdir -p "$OUT/guisep"
+echo '{"scene": "screen-cam", "files": "separate", "mic_enabled": false}' >"$OUT/guisep/settings.json"
+if REC_GUI_SELFTEST=separate REC_TEST_PATTERN=1 REC_TEST_CAMERA=1 REC_GUI_BACKGROUND=1 REC_OUTPUT_DIR="$OUT/guisep" \
+     REC_SETTINGS="$OUT/guisep/settings.json" "$REC" gui >"$OUT/guisep.log" 2>&1 \
+   && s=$(ls "$OUT"/guisep/rec-*-screen.mov 2>/dev/null | head -1) && [ -n "$s" ] \
+   && c=${s%-screen.mov}-camera.mov && [ -f "$c" ] && [ ! -e "${s%-screen.mov}.mov" ] \
+   && grep -q "selftest: saved=Some(\"$s\") files=\[\"$s\", \"$c\"\]" "$OUT/guisep.log" \
+   && scripts/trackcheck.py "$s" "$c" --window 1 >"$OUT/guisep.check" 2>&1; then
+  echo "PASS  gui-separate  (the app wrote the screen and camera files, in sync)"; pass=$((pass+1))
+else
+  echo "FAIL  gui-separate  (see $OUT/guisep.log, $OUT/guisep.check)"; fail=$((fail+1))
+fi
 # Levels: --system-gain reaches the system audio's own track (here the only
 # one). In the app, the system fader moves while recording (0 dB, -12 dB,
 # muted, 0 dB) and the file and the replay buffer follow it.

@@ -103,8 +103,10 @@ pub fn activate() {
 /// Reveal a file in Finder.
 pub fn reveal(path: &std::path::Path) {
     use objc2_foundation::{NSArray, NSURL};
-    let url = NSURL::fileURLWithPath(&crate::util::ns(&path.to_string_lossy()));
-    objc2_app_kit::NSWorkspace::sharedWorkspace().activateFileViewerSelectingURLs(&NSArray::from_retained_slice(&[url]));
+    // With the recording's separate screen and camera files, if any.
+    let urls: Vec<_> =
+        crate::separate::recording_files(path).iter().map(|p| NSURL::fileURLWithPath(&crate::util::ns(&p.to_string_lossy()))).collect();
+    objc2_app_kit::NSWorkspace::sharedWorkspace().activateFileViewerSelectingURLs(&NSArray::from_retained_slice(&urls));
 }
 
 /// Open a folder in Finder.

@@ -738,6 +738,8 @@ fn sources(ui: &mut Ui, st: &mut State) {
         w::row(ui, "Codec", |ui| value(ui, format!("{codec} · .{}", s.container)));
         w::divider(ui);
         w::row(ui, "Folder", |ui| value(ui, tilde(&s.output_dir)));
+        w::divider(ui);
+        separate_controls(ui, &mut s, idle);
     });
 
     live_controls(ui, st, &mut s);
@@ -921,6 +923,29 @@ fn camera_adjustments(ui: &mut Ui, st: &State, s: &mut Settings) {
 
 fn bytes_text(b: usize) -> String {
     if b >= 1 << 30 { format!("{:.1} GB", b as f64 / (1u64 << 30) as f64) } else { format!("{:.0} MB", b as f64 / (1u64 << 20) as f64) }
+}
+
+/// Separate files: the screen and the camera each in a file of its own,
+/// with the composed video too if wanted. It needs a camera scene.
+fn separate_controls(ui: &mut Ui, s: &mut Settings, idle: bool) {
+    use crate::separate::Files;
+    let cam = s.scene.uses_cam();
+    let mut separate = s.files.separate();
+    let mut composed = s.files == Files::Both;
+    w::row(ui, "Separate files", |ui| w::switch(ui, &mut separate, idle && cam))
+        .on_hover_text("Record the screen and the camera to two files, in sync, to edit apart");
+    if !cam {
+        w::hint(ui, "Pick a camera scene to record the camera separately.");
+    } else if separate {
+        w::hint(ui, "NAME-screen.mov and NAME-camera.mov start and stop together.");
+        w::divider(ui);
+        w::row(ui, "Composed video too", |ui| w::switch(ui, &mut composed, idle));
+    }
+    s.files = match (separate, composed) {
+        (false, _) => Files::Composed,
+        (true, false) => Files::Separate,
+        (true, true) => Files::Both,
+    };
 }
 
 /// Replay buffer and streaming: both use the shared live encode and run
@@ -1154,6 +1179,20 @@ fn settings_form(ui: &mut Ui, st: &mut State) {
         let opts = [("mov".to_string(), "QuickTime (.mov)".to_string()), ("mp4".to_string(), "MPEG-4 (.mp4)".to_string())];
         combo(ui, "container", &mut s.container, &opts, s.codec != Some(Codec::Prores));
         ui.end_row();
+        ui.label("Files");
+        use crate::separate::Files;
+        let opts = vec![
+            (Files::Composed, "One video (the scene)".to_string()),
+            (Files::Separate, "Screen and camera, separately".to_string()),
+            (Files::Both, "Both: the video and the two files".to_string()),
+        ];
+        combo(ui, "files", &mut s.files, &opts, st.recording.is_none() && !st.finishing);
+        ui.end_row();
+        if s.files.separate() && !s.scene.uses_cam() {
+            ui.label("");
+            ui.label(RichText::new("Separate files need a camera scene.").size(SECONDARY).color(theme::pal(ui).secondary));
+            ui.end_row();
+        }
     });
 
     section(ui, "VIDEO");
