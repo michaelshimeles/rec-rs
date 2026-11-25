@@ -310,6 +310,9 @@ pub struct Snapshot {
     pub controls: Vec<ControlState>,
     /// The last failure, for the UI and the log.
     pub error: Option<String>,
+    /// Counts the UI's changes, so a read-back that overlapped one isn't
+    /// shown over it.
+    edits: u64,
 }
 
 impl Snapshot {
@@ -399,14 +402,17 @@ impl Hardware {
 
     /// Set a control; the UI shows the value at once.
     pub fn set(&self, c: Control, value: i32) {
-        if let Some(s) = self.state.lock().unwrap().controls.iter_mut().find(|s| s.control == c) {
-            s.range.cur = value.clamp(s.range.min, s.range.max);
+        let mut s = self.state.lock().unwrap();
+        s.edits += 1;
+        if let Some(cs) = s.controls.iter_mut().find(|cs| cs.control == c) {
+            cs.range.cur = value.clamp(cs.range.min, cs.range.max);
         }
         let _ = self.tx.send(Msg::Set(c, value));
     }
 
     /// Every control back to the camera's default (autofocus on).
     pub fn reset(&self) {
+        self.state.lock().unwrap().edits += 1;
         let _ = self.tx.send(Msg::Reset);
     }
 
@@ -578,15 +584,17 @@ fn sent(state: &Mutex<Snapshot>, changed: &impl Fn(), results: &[(Control, Resul
 /// The reads happen without the snapshot's lock: each can take up to its
 /// timeout, and the UI reads the snapshot every frame.
 fn read_back<R: Requests>(cam: &Camera<R>, state: &Mutex<Snapshot>, changed: &impl Fn()) {
-    let (camera, controls) = {
+    let (camera, edits, controls) = {
         let s = state.lock().unwrap();
-        (s.camera.clone(), s.controls.iter().map(|c| c.control).collect::<Vec<_>>())
+        (s.camera.clone(), s.edits, s.controls.iter().map(|c| c.control).collect::<Vec<_>>())
     };
     let values: Vec<(Control, i32)> = controls.into_iter().filter_map(|c| cam.read(c, GET_CUR).ok().map(|v| (c, v))).collect();
     {
         let mut s = state.lock().unwrap();
-        // Another camera was attached meanwhile.
-        if s.camera != camera {
+        // Another camera was attached, or the UI changed something, while
+        // these reads ran: they're stale. A change schedules another
+        // read-back.
+        if s.camera != camera || s.edits != edits {
             return;
         }
         for (c, v) in values {
@@ -1275,6 +1283,54 @@ mod tests {
             std::thread::sleep(Duration::from_millis(5));
         }
         assert!(worst < Duration::from_millis(50), "the UI waited {worst:?} for the snapshot");
+        hw.finish();
+    }
+
+    /// A change made while the worker reads the camera back wins: the
+    /// read-back (of the camera's older value) isn't shown over it. Reads
+    /// and writes take 200 ms each here, so a stale value would show.
+    #[test]
+    fn edits_during_a_read_back_win() {
+        struct Sluggish(FakeOsmo, Arc<std::sync::atomic::AtomicBool>);
+        impl Requests for Sluggish {
+            fn get(&self, r: u8, u: u8, s: u8, l: usize) -> Result<Vec<u8>, i32> {
+                if r == GET_CUR && self.1.load(std::sync::atomic::Ordering::SeqCst) {
+                    std::thread::sleep(Duration::from_millis(200));
+                }
+                self.0.get(r, u, s, l)
+            }
+            fn set(&self, u: u8, s: u8, d: &[u8]) -> Result<(), i32> {
+                if self.1.load(std::sync::atomic::Ordering::SeqCst) {
+                    std::thread::sleep(Duration::from_millis(200));
+                }
+                self.0.set(u, s, d)
+            }
+        }
+        let slow = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = slow.clone();
+        let hw = Hardware::with_opener(
+            || {},
+            move |_: &str| Ok(Camera { dev: Sluggish(FakeOsmo::new(), flag.clone()), vc: parse_config(OSMO).unwrap() }),
+            Duration::from_millis(10),
+        );
+        hw.attach("0x1000002ca30023", &BTreeMap::new());
+        let t = Instant::now();
+        while hw.snapshot().probing && t.elapsed() < Duration::from_secs(3) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        slow.store(true, std::sync::atomic::Ordering::SeqCst);
+        // Sent in 200 ms, then read back from 210 ms to 1010 ms.
+        hw.set(Control::Zoom, 150);
+        std::thread::sleep(Duration::from_millis(400));
+        // Mid read-back: the camera still has 150.
+        hw.set(Control::Zoom, 300);
+        let t = Instant::now();
+        let mut seen = std::collections::BTreeSet::new();
+        while t.elapsed() < Duration::from_millis(1100) {
+            seen.insert(hw.snapshot().get(Control::Zoom).unwrap().range.cur);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(seen.into_iter().collect::<Vec<_>>(), [300], "the slider jumped back");
         hw.finish();
     }
 
