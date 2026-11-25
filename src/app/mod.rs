@@ -564,6 +564,10 @@ impl App {
         if std::env::var_os("REC_TEST_PATTERN").is_some() {
             args.push("--test-pattern".into());
         }
+        // REC_TEST_CAMERA: the CLI's generated camera, in camera scenes.
+        if std::env::var_os("REC_TEST_CAMERA").is_some() && settings.scene.uses_cam() {
+            args.push("--test-camera".into());
+        }
         let refs: Vec<&str> = args.iter().map(String::as_str).collect();
         let (mut o, t) = crate::prepare(crate::parse_record_args(&refs)?)?;
         o.live = Some(self.st.live.clone());
@@ -753,7 +757,7 @@ impl App {
             .and_then(|(o, t)| Session::start_with_camera(&o, t, true, Some(cb), cam));
         match r {
             Ok(sess) => {
-                let _ = std::fs::write(record::pidfile_path(), format!("{}\n{}\n", std::process::id(), file.display()));
+                let _ = std::fs::write(record::pidfile_path(), record::pidfile_text(&sess.outputs));
                 self.st.pip_applied = Some(self.st.settings.pip_spec());
                 self.st.volumes_applied = Some(self.st.settings.volumes());
                 self.st.recording = Some(sess);
@@ -1290,6 +1294,29 @@ impl SelfTest {
                     }
                     push(Cmd::Quit);
                     self.step = 6;
+                }
+                _ => {}
+            }
+            return;
+        }
+        // REC_GUI_SELFTEST=separate: record about 3 s with the settings as
+        // saved (the files option among them) and list the files written.
+        if std::env::var("REC_GUI_SELFTEST").as_deref() == Ok("separate") {
+            match self.step {
+                0 if t > 2.0 => {
+                    push(Cmd::ToggleRecording);
+                    self.step = 1;
+                }
+                1 if t > 5.0 => {
+                    println!("selftest: recording={} error={:?}", app.st.recording.is_some(), app.st.error);
+                    push(Cmd::ToggleRecording);
+                    self.step = 2;
+                }
+                2 if !app.st.finishing && app.st.recording.is_none() => {
+                    let files = app.st.last_file.as_deref().map(crate::separate::recording_files).unwrap_or_default();
+                    println!("selftest: saved={:?} files={files:?} error={:?}", app.st.last_file, app.st.error);
+                    push(Cmd::Quit);
+                    self.step = 3;
                 }
                 _ => {}
             }

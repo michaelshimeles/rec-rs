@@ -7,6 +7,9 @@ DaVinci Resolve. It can also keep a **replay buffer** of the last seconds and **
 RTMP/RTMPS (YouTube, Twitch, Kick, any server) or WHIP (WebRTC) to as many destinations as you
 like at once, from one shared hardware encode, with or without recording.
 
+It can also write the screen and the camera as **separate files** at the same time, in sync, to
+edit them apart later.
+
 It uses only Apple frameworks:
 
 - **ScreenCaptureKit** for display and window capture, system audio and the microphone. Frames
@@ -95,6 +98,7 @@ scripts/selftest.sh              # records through every pipeline and verifies e
 scripts/selftest.sh --no-screen  # skip the cases that need Screen Recording
 scripts/soak.sh 1800             # 30-minute 4K60 soak with CPU/memory sampling and ffprobe checks
 scripts/synccheck.py FILE        # A/V offset of a flash + beep recording
+scripts/trackcheck.py SCREEN CAMERA  # frame-by-frame sync of a --separate recording's two files
 scripts/levelcheck.py FILE --expect 0,-12,mute,0  # beep levels of a test-pattern recording
 python3 -m doctest scripts/levelcheck.py           # the level checker's own tests
 ```
@@ -160,7 +164,12 @@ The **main window** contains:
     buffer and streams.
   - The meters show the level after the fader. A muted source's meter turns grey and keeps
     moving, so you can see the mic still hears you.
-- **Reveal Last** and **Open Folder**.
+- **Separate files**, in the Output card. With a camera scene, a recording writes the screen and
+  the camera to files of their own, `NAME-screen.mov` and `NAME-camera.mov`, in sync. See
+  [Separate screen and camera files](#separate-screen-and-camera-files). **Composed video too**
+  keeps the usual video of the scene as well. The preview, the replay buffer and streams still
+  show the scene.
+- **Reveal Last** and **Open Folder**. Reveal Last selects every file of the recording.
 - **Replay buffer**: keep the last 15–300 s (default 60) in memory, shown with its memory use.
   **Save Replay** or **⇧⌘S** from anywhere writes it to an MP4 in the output folder without
   stopping anything. ⇧⌘S is only taken while the buffer is on, because it is Save As in most
@@ -184,7 +193,8 @@ The **main window** contains:
 
 The **settings window** (⌘, or the Settings… button) covers:
 
-- Output folder and container (`.mov` or `.mp4`).
+- Output folder and container (`.mov` or `.mp4`), and the files a recording writes: one video of
+  the scene, the screen and the camera separately, or both.
 - Resolution: 720p, 1080p, 1440p, 4K or native. The frame always has the shape of the display
   or window (4K of a 16:10 display is 3456x2160): no black bars, nothing cropped.
 - Frame rate, codec (auto, H.264, HEVC, ProRes) and bitrate.
@@ -232,6 +242,10 @@ rec-rs record -r 4k --cam
 # one window at native resolution, camera-only scene, ProRes
 rec-rs record --window "Safari" -r native --codec prores
 rec-rs record --scene cam -o talking-head.mov
+
+# screen and webcam as two files in sync: talk-screen.mov and talk-camera.mov
+rec-rs record --cam --separate -o talk.mov
+rec-rs record --cam --separate --composed -o talk.mov   # and talk.mov, the composed video
 ```
 
 The default output is `~/Movies/rec-YYYY-MM-DD-HHMMSS.mov`. A live status line shows the
@@ -261,7 +275,10 @@ frames, and pauses don't count.
 | `--no-cursor`, `--clicks` | cursor shown | |
 | `-t, --duration` | | Seconds of output. |
 | `--mic-backend` | `sck` | `sck` (ScreenCaptureKit) or `avcapture`. |
-| `--test-pattern [--noise]` | | Synthetic source: the frame flashes white and the "system audio" beeps once a second, for self-tests and sync checks. |
+| `--separate` | off | Write the screen and the camera to two files in sync instead of one composed video: `NAME-screen.mov` and `NAME-camera.mov` next to `-o NAME.mov`. Turns the webcam on. See [Separate screen and camera files](#separate-screen-and-camera-files). |
+| `--composed` | | With `--separate`: also write the composed video (the scene) to `NAME.mov`. |
+| `--test-pattern [--noise]` | | Synthetic source: the frame flashes white and the "system audio" beeps once a second, for self-tests and sync checks. Each frame also carries its capture time as a row of black and white blocks. |
+| `--test-camera[=letterbox]` | | A generated camera instead of the webcam (no Camera permission needed): 1280x720 at 30 fps, flashing white with the test pattern and carrying the same time code. `letterbox` sends a 720x1280 frame with a 16:9 picture and black bars, like a DJI Osmo Pocket 3 on a portrait format. |
 | `--replay SECS` | off | Keep the last 15–300 s of the live encode in memory; `rec-rs save-replay` writes them to an MP4 next to the output. |
 | `--stream DEST` | | Stream to `youtube`, `twitch`, `kick`, an `rtmp://`/`rtmps://` URL or a WHIP `http(s)://` URL. Repeatable: one encode feeds every destination. |
 | `--no-record` | | Write no file (replay buffer and/or streaming only). |
@@ -368,8 +385,50 @@ rec-rs record --no-record --stream rtmp://localhost/live --stream http://localho
   continuous across buffers. The mix runs through a limiter that keeps it under −1 dBFS
   instead of clipping. Measured with a sweep, tones and noise played as system audio: flat
   within 0.1 dB from 50 Hz to 20 kHz, no clicks.
+- **Separate files.** See [below](#separate-screen-and-camera-files).
 - **Pause.** Pauses cut whole frame slots out of the timeline. Audio is cut at the exact sample
   and shifted with the video, so there is no gap and no drift.
+
+## Separate screen and camera files
+
+`--separate`, or Separate files in the app, records the screen and the camera to two files at
+the same time. Edit them apart later: move, resize or cut the camera in an editor.
+
+| File | Contents |
+|---|---|
+| `NAME-screen.mov` | The screen at the output size, without the camera. It has every audio track the composed video would have, per `--audio-tracks`. |
+| `NAME-camera.mov` | The camera's picture at the size the camera sends it, 1280x720 for most cameras, with any black bars cropped off. One audio track, the mix of system audio and the mic, or the one source that is on. |
+| `NAME.mov` | The composed video of the scene, written only with `--composed` (Composed video too in the app). It is the same file a recording without `--separate` writes. |
+
+- **In sync by construction.** One session writes all the files, on one host clock and one
+  frame grid. Each frame slot goes to every file with the same timestamp. The files start on
+  the same instant and have the same number of frames and the same length. A pause cuts the same
+  slots from all of them. If one file's encoder can't take a frame, Rec drops that slot from all
+  of them. Put both files at the same point on an editor's timeline and they line up. They also
+  carry the same audio, so an editor that syncs clips by waveform lines them up too.
+- **Measured.** The test sources draw each frame's capture time into the picture, and
+  `scripts/trackcheck.py` reads it back from both files. Over a 10-minute take the screen and the
+  camera were 0.000 ms apart at the start and at the end, and no frame was lost. See
+  [PERFORMANCE.md](PERFORMANCE.md#separate-screen-and-camera-files-2026-11-24).
+- **Audio.** The screen's file gets every track, as the composed video would, so it is a
+  complete recording by itself. The camera's file gets the mix as well. It plays with sound on
+  its own, and either file can be synced by waveform. Both hold the same samples, so mute one in
+  the editor.
+- **The camera's picture.** This is the camera's own frame, not the overlay. It has no shape,
+  border or shadow, and Rec doesn't crop it to the overlay's aspect ratio. Rec does crop black
+  bars off, as it does for the overlay. The file keeps the size the picture has when the
+  recording starts. If the crop changes mid-take, Rec scales the picture to fit that size. A
+  camera started cold gets 2 s for its crop to settle before the files start. The picture
+  follows the Mirror switch, like the composed video, and Mirror is on by default. Turn it off
+  for an unmirrored camera file. Colors take the same CoreImage path as the overlay, so the
+  camera looks the same in both files.
+- **Frame rate and codec.** Both files use the output frame rate, codec and container. Cameras
+  send 30 fps, so in a 60 fps recording each camera frame shows for two frames, as in the
+  composed video. The camera's file gets a bitrate for its own size. Each file has its own
+  encoder session.
+- **Composed video.** `--separate` writes the two files instead of it, unless `--composed` is
+  on too. The preview, the replay buffer and streams still show the scene. A recording without
+  `--separate` is the same as before.
 
 ## Feature comparison with OBS (macOS)
 
@@ -418,7 +477,10 @@ rec-rs record --no-record --stream rtmp://localhost/live --stream http://localho
   or the destinations needs streaming stopped. HEVC to YouTube was tested only against a local
   server, not YouTube itself.
 - **8-bit SDR only.** HDR displays are tone-mapped by ScreenCaptureKit.
-- **Webcam overlay.** The overlay is burned into the video; there is no separate camera track.
+- **Webcam overlay.** The overlay is burned into the composed video. To edit the camera apart,
+  record with `--separate`, which writes it to a file of its own.
+- **Separate files.** There is no timecode track. Line the files up at their start or by their
+  audio. The camera's file runs at the output frame rate, repeating camera frames.
 - **Output latency read once.** It is read when recording starts. Switching output devices
   mid-recording (to AirPods, say) leaves the old offset in place.
 - **Mix track resampling.** A mic that isn't 48 kHz is resampled linearly per buffer for the mix
@@ -440,11 +502,12 @@ rec-rs record --no-record --stream rtmp://localhost/live --stream http://localho
 | `src/camera.rs` | Webcam (and its format) and AVCapture mic, device lists |
 | `src/bars.rs` | Black bars around a camera's picture: measuring them and deciding when to crop |
 | `src/compose.rs` | CoreImage scenes and webcam overlay |
+| `src/separate.rs` | Separate screen and camera files: naming, the camera file's size and picture |
 | `src/mixer.rs` | Real-time audio mixer, faders (level, mute, gain ramps) |
 | `src/live/` | Shared live encode (VideoToolbox H.264, AAC/Opus), replay buffer, RTMP/RTMPS and WHIP outputs, Keychain |
 | `src/tcc.rs` | Permissions and responsibility disclaim |
 | `src/probe.rs` | AVFoundation verification |
-| `src/synth.rs` | Test pattern with flash + beep |
+| `src/synth.rs` | Test pattern with flash + beep, the generated test camera, and the time code both draw |
 | `src/scale.rs` | Native-resolution screen scaling (Metal Performance Shaders Lanczos, VideoToolbox fallback) |
 | `scripts/` | Build, self-test, soak, sync checks (`synccheck.py` with ffmpeg, `avsync.swift` with AVFoundation), level checks (`levelcheck.py`) and quality metrics (`quality.sh`, `encquality.sh`, `testcard.swift`) |
 | `site/` | Download page: SvelteKit, deployed to Vercel (see [site/README.md](site/README.md)) |

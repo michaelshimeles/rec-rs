@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Result, bail};
 
 use crate::camera::{self, Camera, Mic};
-use crate::synth::Synth;
+use crate::synth::{Synth, TestCamera};
 use crate::compose::{Compositor, PipSpec, Scene};
 use crate::screen::{self, ScreenCapture, ScreenConfig};
 use crate::tcc::{self, Status};
@@ -96,6 +96,11 @@ pub struct Options {
     pub quiet: bool,
     /// Replace the screen with a generated pattern (Some(noise)).
     pub test_pattern: Option<bool>,
+    /// Which files to write: the composed video, the screen and the camera
+    /// separately, or both (`--separate`, `--composed`).
+    pub files: crate::separate::Files,
+    /// A generated camera instead of the webcam (Some(letterbox)).
+    pub test_camera: Option<bool>,
     pub audio_layout: AudioLayout,
     /// [system, mic] fader levels at the start; `Session::set_volumes`
     /// changes them live.
@@ -149,7 +154,7 @@ pub fn check_permissions(o: &Options) -> Result<()> {
     if o.mic.is_some() && tcc::mic_status() != Status::Granted {
         missing.push("Microphone");
     }
-    if o.webcam.is_some() && tcc::camera_status() != Status::Granted {
+    if o.webcam.is_some() && o.test_camera.is_none() && tcc::camera_status() != Status::Granted {
         missing.push("Camera");
     }
     if !missing.is_empty() {
@@ -165,11 +170,14 @@ pub struct Session {
     pacer: Option<std::thread::JoinHandle<()>>,
     screen: Option<ScreenCapture>,
     synth: Option<Synth>,
+    test_cam: Option<TestCamera>,
     cam: Option<Camera>,
     av_mic: Option<Mic>,
     /// Keeps App Nap and timer coalescing off while capturing.
     activity: Option<SendBox<objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_foundation::NSObjectProtocol>>>>,
     pub output: Option<PathBuf>,
+    /// Every file written, `output` first (see `separate::outputs`).
+    pub outputs: Vec<PathBuf>,
     pub started: Instant,
     pub description: String,
 }
@@ -178,6 +186,11 @@ pub struct Session {
 /// settled (measured on a MacBook Pro camera: about 94% of the final
 /// brightness after 1.5 s, 98% after 2 s).
 const CAMERA_SETTLE_SECS: f64 = 2.0;
+
+/// How long after its first frame a camera's black-bar crop has settled
+/// (`bars` crops once 4 measurements 0.5 s apart agree). The camera's own
+/// file takes its size from that crop.
+const CROP_SETTLE_SECS: f64 = 2.0;
 
 /// Size ScreenCaptureKit delivers: the native size when it is larger than
 /// the output (scaled down here with a high-quality filter), else the output
@@ -213,7 +226,9 @@ impl Session {
         let spec = VideoSpec { width: w, height: h, fps: o.fps, codec: o.codec, bitrate: o.bitrate, pixel_format };
         let compositor = o.webcam.as_ref().map(|_| Compositor::new(w, h, o.pip.clone()));
         let path = write.then_some(o.output.as_path());
-        let mut sink = Sink::new(path, &spec, o.system_audio, o.mic.is_some(), o.audio_layout, o.volumes, compositor, o.scene, preview)?;
+        // The composed video, unless only the separate files are wanted.
+        let file = path.filter(|_| o.files.composed());
+        let mut sink = Sink::new(file, &spec, o.system_audio, o.mic.is_some(), o.audio_layout, o.volumes, compositor, o.scene, preview)?;
         if capture_size(o) != (w, h)
             && let Some(sc) = crate::scale::FrameScaler::new(w, h)
         {
@@ -223,6 +238,11 @@ impl Session {
             sink.fill_window_corners();
         }
         sink.limit_secs(o.duration);
+        let outputs = if write { crate::separate::outputs(&o.output, o.files) } else { vec![] };
+        if write && o.files.separate() {
+            let [screen, cam] = crate::separate::paths(&o.output);
+            sink.write_separate(&screen, &cam, &spec, o.audio_layout, o.pip.mirror)?;
+        }
         // System audio from ScreenCaptureKit is captured when mixed and heard
         // one output latency later; the synthetic source needs no shift.
         let sys_ms = match (o.system_offset_ms, o.test_pattern) {
@@ -246,10 +266,12 @@ impl Session {
             pacer: None,
             screen: None,
             synth: None,
+            test_cam: None,
             cam: None,
             av_mic: None,
             activity: None,
-            output: write.then(|| o.output.clone()),
+            output: outputs.first().cloned(),
+            outputs: outputs.clone(),
             started: Instant::now(),
             description: String::new(),
         };
@@ -261,8 +283,8 @@ impl Session {
                 if let Some(s) = shared.sink.lock().unwrap().take() {
                     let _ = s.finish(0.0);
                 }
-                if write {
-                    let _ = std::fs::remove_file(&o.output);
+                for f in &outputs {
+                    let _ = std::fs::remove_file(f);
                 }
                 return Err(e);
             }
@@ -280,7 +302,9 @@ impl Session {
                 objc2::rc::autoreleasepool(|_| {
                     let mut failure = None;
                     pacer_shared.with(|s| {
+                        let t = Instant::now();
                         s.emit_until(now - s.lag());
+                        s.stats.pacer_max = s.stats.pacer_max.max(t.elapsed().as_secs_f64());
                         failure = s.failure().map(str::to_string);
                     });
                     if let Some(f) = failure {
@@ -301,7 +325,19 @@ impl Session {
     }
 
     fn start_sources(&mut self, o: &Options, target: Option<screen::Target>, pixel_format: u32, cam: Option<Camera>) -> Result<()> {
-        let (w, h) = o.size;
+        // --test-camera: a generated camera stands in for the webcam. Its
+        // picture needs no time to settle, only a letterbox crop does.
+        if let Some(letterbox) = o.test_camera {
+            if let Some(c) = cam {
+                c.stop();
+            }
+            if self.output.is_some() {
+                let settle = if letterbox { CROP_SETTLE_SECS } else { 0.0 };
+                self.shared.with(|s| s.wait_for_camera(settle));
+            }
+            self.test_cam = Some(TestCamera::start(letterbox, self.shared.clone()));
+            return self.start_screen(o, target, pixel_format);
+        }
         let mut cam = cam;
         if let Some(sel) = &o.webcam {
             let reuse = cam.take_if(|c| Camera::resolve(sel.as_deref()).is_ok_and(|id| id == c.id));
@@ -315,8 +351,10 @@ impl Session {
             // Start the file once the camera shows a picture and has had
             // time to settle its exposure, so it doesn't open on black or
             // dark frames (a preview just shows them).
-            if self.output.is_some() && o.scene.uses_cam() {
+            if self.output.is_some() && (o.scene.uses_cam() || o.files.separate()) {
                 let settle = (CAMERA_SETTLE_SECS - c.started.elapsed().as_secs_f64()).max(0.0);
+                let fresh = c.started.elapsed().as_secs_f64() < CROP_SETTLE_SECS;
+                let settle = if o.files.separate() && fresh { settle.max(CROP_SETTLE_SECS) } else { settle };
                 self.shared.with(|s| s.wait_for_camera(settle));
             }
             self.cam = Some(c);
@@ -324,6 +362,12 @@ impl Session {
         if let Some(c) = cam {
             c.stop();
         }
+        self.start_screen(o, target, pixel_format)
+    }
+
+    /// Start the screen (or the test pattern) and the microphone.
+    fn start_screen(&mut self, o: &Options, target: Option<screen::Target>, pixel_format: u32) -> Result<()> {
+        let (w, h) = o.size;
         let sck_mic = if o.mic_backend == MicBackend::Sck { o.mic.clone() } else { None };
         if o.mic_backend == MicBackend::Avcapture
             && let Some(sel) = &o.mic
@@ -360,6 +404,9 @@ impl Session {
         let err = self.screen.take().and_then(|s| s.stop().err());
         if let Some(mut s) = self.synth.take() {
             s.stop();
+        }
+        if let Some(mut c) = self.test_cam.take() {
+            c.stop();
         }
         if let Some(c) = self.cam.take() {
             c.stop();
@@ -495,7 +542,7 @@ pub fn run(o: Options, target: Option<screen::Target>) -> Result<Stats> {
     // Before starting: a pause requested during camera startup still applies.
     install_pause_signals();
     let pidfile = pidfile_path();
-    let _ = std::fs::write(&pidfile, format!("{}\n{}\n", std::process::id(), o.output.display()));
+    let _ = std::fs::write(&pidfile, pidfile_text(&crate::separate::outputs(&o.output, o.files)));
     let mut stream_ids = vec![];
     if let Some(l) = &o.live {
         for (url, key) in &o.streams {
@@ -521,7 +568,7 @@ pub fn run(o: Options, target: Option<screen::Target>) -> Result<Stats> {
             "rec: {} {} -> {} ({}x{} @ {}fps {:?}{}, system audio {}, mic {}, webcam {})",
             if o.write { "recording" } else { "capturing" },
             sess.description,
-            if o.write { o.output.display().to_string() } else { "no file".into() },
+            if o.write { sess.outputs.iter().map(|f| f.display().to_string()).collect::<Vec<_>>().join(", ") } else { "no file".into() },
             w,
             h,
             o.fps,
@@ -529,7 +576,7 @@ pub fn run(o: Options, target: Option<screen::Target>) -> Result<Stats> {
             if o.codec == Codec::Prores { String::new() } else { format!(" {} Mb/s", o.bitrate / 1_000_000) },
             if o.system_audio { "on" } else { "off" },
             mic_desc,
-            sess.camera_name().unwrap_or("off"),
+            sess.camera_name().unwrap_or(if o.test_camera.is_some() { "test camera" } else { "off" }),
         );
         eprintln!("rec: press Ctrl-C to stop");
     }
@@ -637,6 +684,15 @@ pub fn pidfile_path() -> PathBuf {
     std::env::temp_dir().join("rec.pid")
 }
 
+/// The pidfile: this process, then every file being written.
+pub fn pidfile_text(files: &[PathBuf]) -> String {
+    let mut t = format!("{}\n", std::process::id());
+    for f in files {
+        t += &format!("{}\n", f.display());
+    }
+    t
+}
+
 /// Send `sig` to the running recorder (SIGUSR1 pause, SIGUSR2 resume,
 /// SIGINFO save replay).
 pub fn signal_running(sig: libc::c_int) -> Result<()> {
@@ -654,7 +710,7 @@ pub fn stop_running() -> Result<()> {
     let text = std::fs::read_to_string(&path).map_err(|_| anyhow::anyhow!("no recording in progress"))?;
     let mut lines = text.lines();
     let pid: i32 = lines.next().unwrap_or("").trim().parse()?;
-    let file = lines.next().unwrap_or("").to_string();
+    let files: Vec<&str> = lines.collect();
     if unsafe { libc::kill(pid, 0) } != 0 {
         let _ = std::fs::remove_file(&path);
         bail!("no recording in progress (stale pidfile removed)");
@@ -668,6 +724,8 @@ pub fn stop_running() -> Result<()> {
         }
         std::thread::sleep(Duration::from_millis(50));
     }
-    println!("{file}");
+    for f in files {
+        println!("{f}");
+    }
     Ok(())
 }

@@ -162,6 +162,87 @@ With a busy CBR stream, WHIP sends only the real picture data. str0m drops the H
 units VideoToolbox pads CBR with, so a static screen streams at about 0.5 Mb/s over WebRTC
 and at the full 6 Mb/s over RTMP.
 
+## Separate screen and camera files (2026-11-24)
+
+`--separate` writes the screen and the camera to files of their own (see the README). These
+numbers come from a release build of the feature branch on the same machine. The machine was
+busy with other work during the runs: load average 6 to 9, with the installed Rec Dev app using
+about 40% of a core.
+
+### Sync
+
+The test sources (`--test-pattern --test-camera`) draw each frame's capture time, on the host
+clock in 1/60000 s, as a row of black and white blocks. `scripts/trackcheck.py` reads it back
+from every frame of both files. For each camera frame it takes the first slot that shows it and
+compares its capture time with the screen frame's in the same slot. 1080p60 H.264, system audio
+(the test beeps), no mic.
+
+| Take | Files | Frames, screen / camera | Length | Camera frames in the file | Offset, first 10 s | Offset, last 10 s | Drift | Audio, camera file vs screen file | A/V in each file |
+|---|---|---|---|---|---|---|---|---|---|
+| 1 min | screen, camera | 3600 / 3600 | 60.000 s each, both start at 0 | 1800 of 1800 | 0.000 ms (300 frames) | 0.000 ms (300 frames) | 0.000 ms | 0.000 ms at the start and the end | 0.0 ms, 60 of 60 flashes |
+| 10 min | composed, screen, camera | 36000 / 36000, composed 36000 | 600.000 s each, both start at 0 | 18000 of 18000 | 0.000 ms (300 frames) | 0.000 ms (300 frames) | 0.000 ms | 0.000 ms at the start and the end | 0.0 ms, 600 of 600 flashes, all three files |
+
+- Both takes pass `trackcheck.py --strict`: every slot of the screen file shows a new screen
+  frame, every frame gap is 16.667 ms, and every camera frame shows up in the camera file.
+- The camera sends 30 fps into a 60 fps file, so every other slot repeats its previous frame.
+  Over all slots the camera picture is 8.3 ms older than the screen's on average (0 or 16.7
+  ms), the same as in the composed video.
+- Both test sources run on the host clock, so this measures the recorder: one start time, one
+  frame grid, the same pauses, no lost frames. A real camera's frames carry AVFoundation
+  timestamps on the same clock. Their delivery delay (70 to 120 ms for webcams) is what the
+  emission lag already absorbs for the overlay.
+- A 5 s take with a 2 s pause has 300 frames in each file and the same 122-slot cut in both.
+- `trackcheck.py` fails a camera file shifted by one frame: +16.7 ms, 239 frames against 240.
+
+**Real camera.** 8 s with a DJI Osmo Pocket 3 and the test pattern as the screen: Rec picked
+the camera's 1280x720 landscape format, and the camera file is 1280x720. Both files have 480
+frames, last 8.000 s and start at 0. The test camera's letterbox mode, a 720x1280 frame with a
+16:9 picture, gives a 720x400 camera file with no bars.
+
+### CPU
+
+The recorder's `ps` `%cpu` every 2 s over 60 s (`SOAK_EVERY=2 scripts/soak.sh 60 ...`), mean /
+max in % of one core, and its peak memory. 1080p60 H.264.
+
+| Files | Test pattern + test camera, system audio | Real screen (5K display scaled to 1080p) + test camera, no audio |
+|---|---|---|
+| Composed video only, as before | 33.6% / 58.5%, 140 MB | 25.3% / 36.2%, 70 MB |
+| Separate files only | 26.2% / 39.5%, 114 MB | 19.8% / 25.9%, 70 MB |
+| Separate files and the composed video | 46.1% / 62.5%, 150 MB | 43.8% / 54.8%, 75 MB |
+| Separate files and the composed video, 10 min, `ps` every 5 s | 56.4% / 70.6%, 151 MB | |
+
+- Separate files alone cost less than the composed video, because nothing is composited. The
+  screen frame goes to its encoder as captured and scaled. CoreImage draws the camera's picture
+  once per camera frame, 30 times a second, not once per output frame.
+- Writing all three files costs about 13 to 18 points of a core more than the composed video
+  alone.
+- The test sources are drawn in software inside the recorder, so that column runs higher than
+  with a real screen.
+- On this shared machine the numbers move between runs: the 10-minute take with all three files
+  averaged 56.4%, the 60 s take 46.1%.
+
+### A stall seen once
+
+One 60 s take with all three files had a single stall at 40.8 s: both capture threads waited
+140 ms to hand over a frame. That stretched the emission lag past what the 7-frame screen queue
+covers at 60 fps (about 115 ms), so the screen file repeated its last frame for 32 slots and
+then skipped ahead. The composed file shows the same. The camera file lost nothing.
+
+The capture threads hand frames to the same lock the pacer holds while it composites and
+encodes a slot, so a long pacer pass delays them. A debug counter now prints the longest pass
+(`REC_DEBUG=1`, "longest pacer pass"). Over six more 60 s takes, three composed-only and three
+with all three files, the longest pass was 19.9 to 34.2 ms with all three files and 25.5 to
+81.1 ms with the composed video alone. No take repeated a screen frame, and neither did the
+10-minute take (worst arrival delay 52.7 ms). The composed-only path has the same exposure:
+any pass over about 115 ms costs screen frames.
+
+A single late frame does the same on a small scale. A screen frame that reaches the writer after
+its slot went out leaves the previous frame in that slot, and the next slot catches up. Two
+selftest takes on the busy machine had one such slot each, in the screen file and the composed
+file alike, with the camera still at 0.000 ms. `trackcheck.py` therefore measures each camera
+frame against its slot's own instant, allows late screen frames in up to 1% of the slots, and
+allows none with `--strict`, which the takes above passed.
+
 ## Picture quality (2026-10-12)
 
 Measured with real metrics against lossless references (ffmpeg 8.1:
@@ -266,5 +347,8 @@ preview_pixels -- --ignored --nocapture` with `REC_PV_SRC`, `REC_PV_OUT`,
 scripts/soak.sh 1800                    # 4K60 + webcam + mic + system audio, 30 min
 scripts/soak.sh 1800 -r 4k --no-mic     # screen + system audio only
 scripts/selftest.sh                     # includes sync, pause, audio-gap and app cases
-REC_DEBUG=1 dist/rec-rs record ...      # prints latencies, encoder retries, gaps filled
+REC_DEBUG=1 dist/rec-rs record ...      # prints latencies, encoder retries, gaps filled, longest pacer pass
+# separate files: 1-minute sync take and CPU, then the frame-by-frame check
+SOAK_EVERY=2 scripts/soak.sh 60 --test-pattern --no-mic --test-camera --separate
+scripts/trackcheck.py NAME-screen.mov NAME-camera.mov --frames 3600 --strict   # NAME: the soak file it printed
 ```
