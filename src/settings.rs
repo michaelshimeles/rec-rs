@@ -2,13 +2,17 @@
 //! The app turns them into the same `record` arguments the CLI takes, so
 //! both share one code path (`crate::prepare`).
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
 
+use crate::camera::CamResolution;
 use crate::compose::{PipSpec, Place, Scene, Shape};
+use crate::look::Adjust;
 use crate::mixer::Volume;
+use crate::uvc::Control;
 use crate::writer::{AudioLayout, Codec};
 
 pub const RESOLUTIONS: [(&str, &str); 5] =
@@ -31,6 +35,43 @@ impl StreamDest {
     }
 }
 
+/// One camera's picture settings. Saved per camera by its name: a USB
+/// camera's unique ID includes the port it is plugged into.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CameraLook {
+    /// Applied by Rec to the camera picture, in the preview and the
+    /// recording alike.
+    pub adjust: Adjust,
+    /// Preview-only guides, never recorded: stripes over overexposed areas
+    /// and a rule-of-thirds grid.
+    pub zebras: bool,
+    pub grid: bool,
+    /// Set on the camera over USB (`uvc`) whenever it is attached; controls
+    /// left out keep the camera's own value.
+    pub hardware: BTreeMap<Control, i32>,
+}
+
+impl CameraLook {
+    /// A DJI Osmo Pocket 3 as a studio webcam, after a camera consultant's
+    /// settings: white balance at `kelvin` (5600 K daylight, sometimes
+    /// 5000 K), tint, exposure, contrast and saturation ("Color: Normal")
+    /// neutral, sharpness -1, autofocus, zebras and the grid on. Their
+    /// noise reduction -1 means less than the camera's own, which Rec can't
+    /// take away, so Rec's stays off. Zoom and roll (framing) are kept.
+    pub fn osmo_studio(&self, kelvin: f64) -> CameraLook {
+        let mut hardware = self.hardware.clone();
+        hardware.remove(&Control::Focus);
+        hardware.insert(Control::FocusAuto, 1);
+        CameraLook {
+            adjust: Adjust { temperature: kelvin, sharpness: -1.0, noise_reduction: 0.0, ..Adjust::NEUTRAL },
+            zebras: true,
+            grid: true,
+            hardware,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
@@ -48,6 +89,11 @@ pub struct Settings {
     pub scene: Scene,
     /// Camera unique ID; None = system default.
     pub camera: Option<String>,
+    /// The camera picture size to ask for.
+    pub camera_resolution: CamResolution,
+    /// Picture settings per camera, by camera name. Cameras at their
+    /// defaults aren't listed.
+    pub camera_looks: BTreeMap<String, CameraLook>,
     pub mic_enabled: bool,
     /// Microphone unique ID; None = system default.
     pub mic: Option<String>,
@@ -108,6 +154,8 @@ impl Default for Settings {
             display: 1,
             scene: Scene::Screen,
             camera: None,
+            camera_resolution: CamResolution::Hd720,
+            camera_looks: BTreeMap::new(),
             mic_enabled: true,
             mic: None,
             mic_name: None,
@@ -239,6 +287,21 @@ impl Settings {
         }
     }
 
+    /// The picture settings of the camera called `name`.
+    pub fn look(&self, name: &str) -> CameraLook {
+        self.camera_looks.get(name).cloned().unwrap_or_default()
+    }
+
+    /// Save the picture settings of the camera called `name` (a camera at
+    /// the defaults is taken off the list).
+    pub fn set_look(&mut self, name: &str, look: CameraLook) {
+        if look == CameraLook::default() {
+            self.camera_looks.remove(name);
+        } else {
+            self.camera_looks.insert(name.to_string(), look);
+        }
+    }
+
     /// The [system, mic] fader levels.
     pub fn volumes(&self) -> [Volume; 2] {
         [
@@ -248,8 +311,8 @@ impl Settings {
     }
 
     /// The settings that need a new capture session when they change. The
-    /// overlay's look and position and the audio levels are applied live
-    /// instead.
+    /// overlay's look and position, the camera adjustments and the audio
+    /// levels are applied live instead.
     pub fn capture_key(&self) -> Settings {
         let d = Settings::default();
         Settings {
@@ -265,6 +328,7 @@ impl Settings {
             pip_border_color: d.pip_border_color,
             pip_shadow: d.pip_shadow,
             mirror: d.mirror,
+            camera_looks: d.camera_looks.clone(),
             preview_low_power: d.preview_low_power,
             replay_enabled: d.replay_enabled,
             replay_secs: d.replay_secs,
@@ -344,6 +408,7 @@ impl Settings {
         a.extend(["--scene".into(), value(self.scene)]);
         if self.scene.uses_cam() {
             a.extend(["--webcam".into(), self.camera.clone().unwrap_or_else(|| "default".into())]);
+            a.extend(["--cam-resolution".into(), value(self.camera_resolution)]);
         }
         if !self.mic_enabled {
             a.push("--no-mic".into());
@@ -526,6 +591,129 @@ mod tests {
         // Settings saved before mute existed load unmuted.
         let old: Settings = serde_json::from_str(r#"{"mic_gain_db": 3.5}"#).unwrap();
         assert_eq!(old.volumes()[1], Volume { db: 3.5, muted: false });
+    }
+
+    /// A settings file written by Rec 0.1.2, before camera resolution and
+    /// camera looks existed.
+    const SETTINGS_0_1_2: &str = r#"{
+  "output_dir": "/Users/someone/Movies",
+  "container": "mov",
+  "codec": null,
+  "resolution": "1080p",
+  "fps": 60,
+  "bitrate_mbps": null,
+  "display": 1,
+  "scene": "screen-cam",
+  "camera": "0x1000002ca30023",
+  "mic_enabled": true,
+  "mic": null,
+  "mic_name": null,
+  "system_audio": true,
+  "audio_tracks": "both",
+  "system_gain_db": 0.0,
+  "mic_gain_db": -3.0,
+  "system_muted": false,
+  "mic_muted": false,
+  "pip_size": 0.22,
+  "pip_place": {"corner": "bottom-right"},
+  "pip_shape": "rounded",
+  "pip_roundness": 0.2,
+  "pip_border": 0.0,
+  "pip_border_color": [255, 255, 255],
+  "pip_shadow": false,
+  "mirror": true,
+  "cursor": true,
+  "clicks": false,
+  "preview_low_power": false,
+  "replay_enabled": false,
+  "replay_secs": 60,
+  "stream_dests": [{"dest": "youtube", "enabled": true}, {"dest": "twitch", "enabled": false}, {"dest": "kick", "enabled": false}],
+  "live_resolution": "1080p",
+  "stream_bitrate_kbps": 6000,
+  "stream_bitrate_auto": true,
+  "stream_codec": "auto",
+  "keyframe_secs": 2.0,
+  "stream_cbr": true,
+  "stream_audio_kbps": 192
+}"#;
+
+    #[test]
+    fn older_settings_files_load_with_camera_defaults() {
+        let s = Settings::from_json(SETTINGS_0_1_2).expect("an older file still loads");
+        assert_eq!(s.camera.as_deref(), Some("0x1000002ca30023"));
+        assert_eq!(s.mic_gain_db, -3.0);
+        assert_eq!(s.camera_resolution, CamResolution::Hd720, "720p, as before");
+        assert!(s.camera_looks.is_empty());
+        assert!(s.look("OsmoPocket3").adjust.is_neutral());
+        // A look saved with only some fields fills in the rest.
+        let s = Settings::from_json(r#"{"camera_looks": {"OsmoPocket3": {"grid": true, "adjust": {"sharpness": -1}}}}"#).unwrap();
+        let look = s.look("OsmoPocket3");
+        assert!(look.grid && !look.zebras && look.hardware.is_empty());
+        assert_eq!(look.adjust, Adjust { sharpness: -1.0, ..Adjust::NEUTRAL });
+    }
+
+    #[test]
+    fn camera_looks_are_kept_per_camera() {
+        let mut s = Settings::default();
+        let osmo = CameraLook { adjust: Adjust { temperature: 5000.0, ..Adjust::NEUTRAL }, zebras: true, ..Default::default() };
+        s.set_look("OsmoPocket3", osmo.clone());
+        let mut mac = CameraLook::default();
+        mac.adjust.exposure = 0.7;
+        mac.hardware.insert(Control::Zoom, 150);
+        s.set_look("MacBook Pro Camera", mac.clone());
+        s.camera_resolution = CamResolution::Hd1080;
+        let json = serde_json::to_string_pretty(&s).unwrap();
+        assert!(json.contains(r#""camera_resolution": "1080p""#), "{json}");
+        assert!(json.contains(r#""zoom": 150"#), "hardware controls by name: {json}");
+        let back = Settings::from_json(&json).unwrap();
+        assert_eq!(back.look("OsmoPocket3"), osmo);
+        assert_eq!(back.look("MacBook Pro Camera"), mac);
+        assert_eq!(back.look("Some Other Camera"), CameraLook::default());
+        assert_eq!(back, s);
+        // Back to the defaults: off the list.
+        s.set_look("OsmoPocket3", CameraLook::default());
+        assert_eq!(s.camera_looks.keys().collect::<Vec<_>>(), ["MacBook Pro Camera"]);
+    }
+
+    #[test]
+    fn osmo_studio_preset() {
+        let mut framed = CameraLook::default();
+        framed.hardware.insert(Control::Zoom, 180);
+        framed.hardware.insert(Control::FocusAuto, 0);
+        framed.hardware.insert(Control::Focus, 900);
+        framed.adjust.exposure = 1.0;
+        let p = framed.osmo_studio(5600.0);
+        let a = p.adjust;
+        assert_eq!((a.temperature, a.tint, a.exposure, a.contrast, a.saturation), (5600.0, 0.0, 0.0, 0.0, 0.0));
+        assert_eq!((a.sharpness, a.noise_reduction, a.brightness), (-1.0, 0.0, 0.0));
+        assert!(p.zebras && p.grid);
+        // Autofocus on, manual focus dropped, framing (zoom) kept.
+        assert_eq!(p.hardware, BTreeMap::from([(Control::FocusAuto, 1), (Control::Zoom, 180)]));
+        // 5600 K is the camera's own color: only the softening runs.
+        assert_eq!(a.steps(), [crate::look::Step::Soften(0.7)]);
+        let warm = CameraLook::default().osmo_studio(5000.0);
+        assert_eq!(warm.adjust.temperature, 5000.0);
+        assert_eq!(warm.adjust.steps().len(), 2, "white balance and softening");
+    }
+
+    #[test]
+    fn camera_settings_and_restarts() {
+        // Picture settings are live; the resolution needs a new session.
+        let a = Settings { scene: Scene::Cam, ..Default::default() };
+        let mut b = a.clone();
+        b.set_look("OsmoPocket3", CameraLook::default().osmo_studio(5600.0));
+        assert_eq!(a.capture_key(), b.capture_key());
+        let c = Settings { camera_resolution: CamResolution::Hd1080, ..a.clone() };
+        assert_ne!(a.capture_key(), c.capture_key());
+        // The resolution reaches the CLI arguments.
+        let args = c.record_args(None);
+        assert!(args.windows(2).any(|w| w == ["--cam-resolution", "1080p"]), "{args:?}");
+        let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        let opts = crate::parse_record_args(&refs).unwrap();
+        assert_eq!(opts.cam_resolution, CamResolution::Hd1080);
+        // No camera, no camera arguments.
+        let args = Settings::default().record_args(None);
+        assert!(!args.iter().any(|a| a == "--cam-resolution"));
     }
 
     #[test]

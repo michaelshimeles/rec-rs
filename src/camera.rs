@@ -20,6 +20,38 @@ pub struct Device {
     pub name: String,
 }
 
+/// The camera picture size Rec asks a camera for. The camera's own format
+/// closest to it is used (see `pick_format`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum, serde::Serialize, serde::Deserialize)]
+pub enum CamResolution {
+    #[default]
+    #[value(name = "720p")]
+    #[serde(rename = "720p")]
+    Hd720,
+    #[value(name = "1080p")]
+    #[serde(rename = "1080p")]
+    Hd1080,
+}
+
+impl CamResolution {
+    pub const ALL: [CamResolution; 2] = [CamResolution::Hd720, CamResolution::Hd1080];
+
+    /// Width and height in pixels.
+    pub fn size(self) -> (u32, u32) {
+        match self {
+            CamResolution::Hd720 => (1280, 720),
+            CamResolution::Hd1080 => (1920, 1080),
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            CamResolution::Hd720 => "720p",
+            CamResolution::Hd1080 => "1080p",
+        }
+    }
+}
+
 fn discover(types: &[&AVCaptureDeviceType], media: &AVMediaType) -> Vec<Retained<AVCaptureDevice>> {
     unsafe {
         let arr = NSArray::from_slice(types);
@@ -181,6 +213,8 @@ pub struct Camera {
     pub name: String,
     /// The device's unique ID.
     pub id: String,
+    /// The picture size it was started for.
+    pub resolution: CamResolution,
     /// When it started: auto-exposure and white balance settle over the
     /// first second or two, so a fresh camera looks dark at first.
     pub started: std::time::Instant,
@@ -218,6 +252,11 @@ impl Camera {
         Ok(unsafe { Self::device(sel)?.uniqueID().to_string() })
     }
 
+    /// The unique ID and name of the camera `sel` names (see `device`).
+    pub fn find(sel: Option<&str>) -> Result<Device> {
+        Ok(describe(&*Self::device(sel)?))
+    }
+
     /// Send frames to another session's sink (the camera keeps running,
     /// already exposed, instead of restarting).
     pub fn retarget(&self, shared: Arc<Shared>) {
@@ -225,15 +264,20 @@ impl Camera {
     }
 
     /// `sel`: None = first camera, else unique ID or name substring.
-    pub fn start(sel: Option<&str>, shared: Arc<Shared>) -> Result<Self> {
+    /// `res`: the picture size to ask for.
+    pub fn start(sel: Option<&str>, res: CamResolution, shared: Arc<Shared>) -> Result<Self> {
         let dev = Self::device(sel)?;
         unsafe {
             let name = dev.localizedName().to_string();
             let session = AVCaptureSession::new();
             session.beginConfiguration();
             // Used only if the device can't be configured below.
-            if session.canSetSessionPreset(AVCaptureSessionPreset1280x720) {
-                session.setSessionPreset(AVCaptureSessionPreset1280x720);
+            let preset = match res {
+                CamResolution::Hd720 => AVCaptureSessionPreset1280x720,
+                CamResolution::Hd1080 => AVCaptureSessionPreset1920x1080,
+            };
+            if session.canSetSessionPreset(preset) {
+                session.setSessionPreset(preset);
             } else {
                 session.setSessionPreset(AVCaptureSessionPresetHigh);
             }
@@ -246,7 +290,7 @@ impl Camera {
             // Pick the format here. A preset takes the first format of its
             // size, and on some cameras (a DJI Osmo Pocket 3) that can be a
             // portrait one with the landscape picture letterboxed inside.
-            let (picked, lock) = use_best_format(&dev).unzip();
+            let (picked, lock) = use_best_format(&dev, res).unzip();
             let output = AVCaptureVideoDataOutput::new();
             output.setVideoSettings(Some(&dict(vec![(
                 cf_ns(kCVPixelBufferPixelFormatTypeKey),
@@ -273,7 +317,7 @@ impl Camera {
                 eprintln!("rec: debug: camera {name}: picked {picked:?}; running {now}, preset {}", session.sessionPreset());
             }
             let id = dev.uniqueID().to_string();
-            Ok(Camera { session, out: delegate, _queue: queue, name, id, started: std::time::Instant::now() })
+            Ok(Camera { session, out: delegate, _queue: queue, name, id, resolution: res, started: std::time::Instant::now() })
         }
     }
 
@@ -297,22 +341,23 @@ pub struct FormatInfo {
 }
 
 /// The format to capture from, by what matters most: landscape, at least
-/// 29.9 fps, no bigger than 1080p, 16:9, then the size closest to 1280x720
+/// 29.9 fps, no bigger than 1080p, 16:9, then the size closest to `target`
 /// (bigger up to 1080p first, then smaller). Ties go to the device's own
 /// order. None for an empty list.
-pub fn pick_format(formats: &[FormatInfo]) -> Option<usize> {
-    const HD: u64 = 1280 * 720;
+pub fn pick_format(formats: &[FormatInfo], target: CamResolution) -> Option<usize> {
     const FULL_HD: u64 = 1920 * 1080;
+    let (tw, th) = target.size();
+    let want = tw as u64 * th as u64;
     let rank = |f: &FormatInfo| {
         let (w, h) = (f.width as u64, f.height as u64);
         let px = w * h;
         let empty = px == 0;
         let portrait = w < h;
         let slow = f.max_fps.is_nan() || f.max_fps < 29.9;
-        let huge = px > FULL_HD;
+        let huge = px > FULL_HD.max(want);
         // More than 1% off 16:9.
         let not_wide = (w * 9).abs_diff(h * 16) * 100 > h * 16;
-        let (smaller, distance) = if px >= HD { (false, px - HD) } else { (true, HD - px) };
+        let (smaller, distance) = if px >= want { (false, px - want) } else { (true, want - px) };
         (empty, portrait, slow, huge, not_wide, smaller, distance)
     };
     formats.iter().enumerate().min_by_key(|(i, f)| (rank(f), *i)).map(|(i, _)| i)
@@ -350,17 +395,17 @@ impl Drop for ConfigLock<'_> {
 }
 
 /// Set `dev` (added to a session, inside its begin/commit configuration)
-/// to the format `pick_format` chooses, at 30 fps where it can. Returns
+/// to the format `pick_format` chooses for `res`, at 30 fps where it can. Returns
 /// the format and the device's lock. Hold the lock until the session runs:
 /// on macOS, setting a format doesn't switch the session to the
 /// input-priority preset as it does on iOS, so the session would put back
 /// the format its own preset wants. None when the device can't be
 /// configured; the session's preset then decides.
-unsafe fn use_best_format(dev: &AVCaptureDevice) -> Option<(FormatInfo, ConfigLock<'_>)> {
+unsafe fn use_best_format(dev: &AVCaptureDevice, res: CamResolution) -> Option<(FormatInfo, ConfigLock<'_>)> {
     unsafe {
         let formats: Vec<Retained<AVCaptureDeviceFormat>> = dev.formats().iter().collect();
         let infos: Vec<FormatInfo> = formats.iter().map(|f| format_info(f)).collect();
-        let i = pick_format(&infos)?;
+        let i = pick_format(&infos, res)?;
         let format = &formats[i];
         if let Err(e) = dev.lockForConfiguration() {
             eprintln!("rec: warning: camera settings locked ({}); using its default format", e.localizedDescription());
@@ -476,8 +521,13 @@ mod tests {
         FormatInfo { width, height, max_fps }
     }
 
+    fn picked_for(formats: &[FormatInfo], target: CamResolution) -> Option<(u32, u32, f64)> {
+        pick_format(formats, target).map(|i| (formats[i].width, formats[i].height, formats[i].max_fps))
+    }
+
+    /// The default target, 720p.
     fn picked(formats: &[FormatInfo]) -> Option<(u32, u32, f64)> {
-        pick_format(formats).map(|i| (formats[i].width, formats[i].height, formats[i].max_fps))
+        picked_for(formats, CamResolution::Hd720)
     }
 
     /// The formats a DJI Osmo Pocket 3 lists, in its order: 420v then 2vuy
@@ -504,7 +554,7 @@ mod tests {
     fn osmo_pocket_3_gets_landscape_720p() {
         let osmo = osmo();
         // The first 1280x720 (420v), not a portrait format.
-        assert_eq!(pick_format(&osmo), Some(4));
+        assert_eq!(pick_format(&osmo, CamResolution::Hd720), Some(4));
         assert_eq!(picked(&osmo), Some((1280, 720, 30.00003)));
         // Without 720p: 1080p, not 4K and not portrait.
         let no_720: Vec<FormatInfo> = osmo.iter().copied().filter(|f| f.height != 720).collect();
@@ -546,13 +596,55 @@ mod tests {
         assert_eq!(picked(&[fmt(1080, 1920, 30.0), fmt(720, 1280, 30.0)]), Some((720, 1280, 30.0)));
         // A broken entry never wins.
         assert_eq!(picked(&[fmt(0, 0, 30.0), fmt(320, 240, 5.0)]), Some((320, 240, 5.0)));
-        assert_eq!(pick_format(&[]), None);
+        assert_eq!(pick_format(&[], CamResolution::Hd720), None);
+        assert_eq!(pick_format(&[], CamResolution::Hd1080), None);
+    }
+
+    #[test]
+    fn osmo_pocket_3_gets_landscape_1080p() {
+        let osmo = osmo();
+        // The first 1920x1080 (420v): not portrait, not 4K.
+        assert_eq!(pick_format(&osmo, CamResolution::Hd1080), Some(6));
+        assert_eq!(picked_for(&osmo, CamResolution::Hd1080), Some((1920, 1080, 30.00003)));
+        // Without 1080p: 720p, the closest smaller size, not 4K.
+        let no_1080: Vec<FormatInfo> = osmo.iter().copied().filter(|f| f.height != 1080).collect();
+        assert_eq!(picked_for(&no_1080, CamResolution::Hd1080), Some((1280, 720, 30.00003)));
+    }
+
+    #[test]
+    fn built_in_and_continuity_cameras_at_1080p() {
+        // The MacBook camera has 1920x1080 at 30 fps.
+        let mac =
+            [fmt(1920, 1080, 30.0), fmt(1760, 1328, 30.0), fmt(1552, 1552, 30.0), fmt(1080, 1920, 30.0), fmt(1280, 720, 30.0), fmt(640, 480, 30.0)];
+        assert_eq!(picked_for(&mac, CamResolution::Hd1080), Some((1920, 1080, 30.0)));
+        let phone = [fmt(640, 480, 60.0), fmt(1920, 1440, 30.0), fmt(3840, 2160, 30.0), fmt(1920, 1080, 60.0), fmt(1280, 720, 60.0)];
+        assert_eq!(picked_for(&phone, CamResolution::Hd1080), Some((1920, 1080, 60.0)));
+        // A 720p-only webcam stays at 720p.
+        let old = [fmt(640, 480, 30.0), fmt(1280, 720, 30.0)];
+        assert_eq!(picked_for(&old, CamResolution::Hd1080), Some((1280, 720, 30.0)));
+        // 1080p only at 15 fps: 720p at 30 is better than a slow 1080p.
+        assert_eq!(picked_for(&[fmt(1920, 1080, 15.0), fmt(1280, 720, 30.0)], CamResolution::Hd1080), Some((1280, 720, 30.0)));
+        // An old 4:3 webcam: the size closest to 1080p, never above it.
+        let old = [fmt(640, 480, 30.0), fmt(1600, 1200, 30.0), fmt(1024, 768, 30.0), fmt(2592, 1944, 30.0)];
+        assert_eq!(picked_for(&old, CamResolution::Hd1080), Some((1600, 1200, 30.0)));
+    }
+
+    #[test]
+    fn camera_resolution_names() {
+        use clap::ValueEnum;
+        for r in CamResolution::ALL {
+            assert_eq!(r.to_possible_value().unwrap().get_name(), r.label());
+            assert_eq!(serde_json::to_string(&r).unwrap(), format!("\"{}\"", r.label()));
+        }
+        assert_eq!(CamResolution::default(), CamResolution::Hd720);
+        assert_eq!(CamResolution::Hd1080.size(), (1920, 1080));
     }
 
     /// Open a real camera through `Camera::start` for a few seconds and
     /// print its format and the bars found, after doing the same with the
     /// old preset-only setup. Run with --ignored --nocapture; REC_CAMERA
-    /// names the camera. Frames go nowhere and only sizes are printed.
+    /// names the camera and REC_CAMERA_RES=1080p asks for 1080p. Frames go
+    /// nowhere and only sizes are printed.
     /// Skips without asking for camera access, and when another app is
     /// using the camera.
     #[test]
@@ -601,7 +693,8 @@ mod tests {
             report("preset only", &delegate);
             session.stopRunning();
         }
-        let cam = Camera::start(sel.as_deref(), shared()).unwrap();
+        let res = if std::env::var("REC_CAMERA_RES").as_deref() == Ok("1080p") { CamResolution::Hd1080 } else { CamResolution::Hd720 };
+        let cam = Camera::start(sel.as_deref(), res, shared()).unwrap();
         std::thread::sleep(Duration::from_secs(3));
         report("Camera::start", &cam.out);
         cam.stop();

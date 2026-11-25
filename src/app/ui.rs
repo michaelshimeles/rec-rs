@@ -7,10 +7,14 @@ use egui::{Align, Color32, CornerRadius, Layout, Margin, RichText, Sense, Stroke
 use super::theme::{self, BODY, SECONDARY, TOOLBAR_H, TRAFFIC_LIGHTS_W};
 use super::widgets::{self as w, Icon};
 use super::{Cmd, Meter, State, Stream};
+use crate::camera::CamResolution;
 use crate::compose::{self, Corner, Place, Scene, Shape};
+use crate::look;
 use crate::mixer::{MAX_DB, MIN_DB};
+use crate::settings::CameraLook;
 use crate::settings::{FPS, RESOLUTIONS};
 use crate::settings::{Settings, StreamDest};
+use crate::uvc::Control;
 use crate::writer::{AudioLayout, Codec};
 
 const RED: Color32 = Color32::from_rgb(0xff, 0x3b, 0x30);
@@ -213,10 +217,81 @@ fn preview(ui: &mut Ui, st: &mut State) {
             // Around the picture, not over its edges.
             ui.painter().rect_stroke(rect, r, Stroke::new(2.0, border), egui::StrokeKind::Outside);
         }
+        camera_guides(ui, st, rect, live);
         if live && st.settings.scene == Scene::ScreenCam {
             drag_overlay(ui, st, rect);
         }
     });
+}
+
+/// The preview-only guides over the camera's part of the preview: zebras
+/// (drawn by the preview worker on its copy of the frame) and the
+/// rule-of-thirds grid (drawn here). Neither reaches the recording.
+fn camera_guides(ui: &mut Ui, st: &State, preview: egui::Rect, live: bool) {
+    let look = st.camera_in_use.as_ref().filter(|_| live).map(|(_, name)| st.settings.look(name));
+    let spec = st.settings.pip_spec();
+    let cam = match (st.settings.scene, &look) {
+        (Scene::Cam, Some(_)) => Some((preview, Shape::Rect, 0.0, 0.0)),
+        (Scene::ScreenCam, Some(_)) => Some((overlay_ui_rect(st, &spec, preview), spec.shape, spec.roundness, spec.border)),
+        _ => None,
+    };
+    let (Some(look), Some((r, shape, roundness, border))) = (look, cam) else {
+        super::preview::set_zebras(None);
+        return;
+    };
+    super::preview::set_zebras(look.zebras.then(|| {
+        let f = |v: f32, o: f32, len: f32| ((v - o) / len) as f64;
+        super::preview::Zebras {
+            rect: [
+                f(r.min.x, preview.min.x, preview.width()),
+                f(r.min.y, preview.min.y, preview.height()),
+                (r.width() / preview.width()) as f64,
+                (r.height() / preview.height()) as f64,
+            ],
+            shape,
+            roundness,
+            border,
+        }
+    }));
+    if look.grid {
+        thirds(ui, r, shape, roundness);
+    }
+}
+
+/// Rule-of-thirds lines inside `r`, kept inside the overlay's `shape`.
+fn thirds(ui: &Ui, r: egui::Rect, shape: Shape, roundness: f64) {
+    let (w, h) = (r.width() as f64, r.height() as f64);
+    // The part of a line inside the shape, as fractions 0..1 along it.
+    let span = |at: &dyn Fn(f64) -> (f64, f64)| {
+        if shape == Shape::Rect {
+            return Some((0.0, 1.0));
+        }
+        let inside: Vec<f64> = (0..=64)
+            .map(|i| i as f64 / 64.0)
+            .filter(|&t| {
+                let (x, y) = at(t);
+                compose::coverage(shape, w, h, roundness, x, y) > 0.5
+            })
+            .collect();
+        Some((*inside.first()?, *inside.last()?))
+    };
+    let painter = ui.painter().with_clip_rect(r);
+    let light = Stroke::new(1.0, Color32::from_white_alpha(140));
+    let dark = Stroke::new(1.0, Color32::from_black_alpha(70));
+    for k in [1.0 / 3.0, 2.0 / 3.0] {
+        if let Some((a, b)) = span(&|t| (w * k, h * t)) {
+            let x = r.left() + (w * k) as f32;
+            let ys = r.top() + (h * a) as f32..=r.top() + (h * b) as f32;
+            painter.vline(x + 1.0, ys.clone(), dark);
+            painter.vline(x, ys, light);
+        }
+        if let Some((a, b)) = span(&|t| (w * t, h * k)) {
+            let y = r.top() + (h * k) as f32;
+            let xs = r.left() + (w * a) as f32..=r.left() + (w * b) as f32;
+            painter.hline(xs.clone(), y + 1.0, dark);
+            painter.hline(xs, y, light);
+        }
+    }
 }
 
 /// Output-pixel frame the overlay geometry is computed in (any size with
@@ -626,10 +701,16 @@ fn sources(ui: &mut Ui, st: &mut State) {
         let mut cams: Vec<(Option<String>, String)> = vec![(None, "Default camera".into())];
         cams.extend(st.cameras.iter().map(|d| (Some(d.id.clone()), d.name.clone())));
         combo(ui, "camera", &mut s.camera, &cams, idle && s.scene.uses_cam());
-        if !s.scene.uses_cam() {
+        if s.scene.uses_cam() {
+            w::field(ui, "Resolution", 72.0, |ui| resolution_picker(ui, &mut s.camera_resolution, idle));
+        } else {
             w::hint(ui, "Pick a camera scene to use the webcam.");
         }
     });
+    if s.scene.uses_cam() {
+        w::header(ui, Icon::Adjust, "Camera Adjustments");
+        w::card(ui, |ui| camera_adjustments(ui, st, &mut s));
+    }
     if s.scene == Scene::ScreenCam {
         w::header(ui, Icon::Overlay, "Camera Overlay");
         w::card(ui, |ui| overlay_controls(ui, &mut s));
@@ -663,7 +744,177 @@ fn sources(ui: &mut Ui, st: &mut State) {
 
     if s != st.settings {
         st.settings = s;
+        // Camera adjustments follow the sliders at once.
+        st.apply_camera();
         let _ = st.settings.save();
+    }
+}
+
+/// 720p or 1080p from the camera (a new capture session: not while
+/// recording).
+fn resolution_picker(ui: &mut Ui, res: &mut CamResolution, enabled: bool) -> bool {
+    let opts: Vec<(CamResolution, &str, bool, &str)> =
+        CamResolution::ALL.iter().map(|r| (*r, r.label(), enabled, "Stop recording to change the camera's resolution")).collect();
+    w::segmented(ui, res, &opts)
+}
+
+/// A value for the camera sliders: signed, with "0" for neutral.
+fn signed(v: f64, decimals: usize, unit: &str) -> String {
+    if v.abs() < 0.5 * 10f64.powi(-(decimals as i32)) {
+        return format!("0{unit}");
+    }
+    format!("{v:+.decimals$}{unit}")
+}
+
+/// The picture settings of the camera in use (or selected): Rec's software
+/// adjustments, the camera's own hardware controls when it has any, the
+/// preview guides, and presets. Live: also while recording.
+fn camera_adjustments(ui: &mut Ui, st: &State, s: &mut Settings) {
+    let p = theme::pal(ui);
+    let Some(name) = st.look_camera() else {
+        w::hint(ui, "No camera connected.");
+        return;
+    };
+    let saved = s.look(&name);
+    let mut lk = saved.clone();
+    // The hardware controls belong to the camera that is running.
+    let hw = st.uvc.snapshot();
+    let running = st.camera_in_use.as_ref().filter(|(id, _)| hw.camera.as_deref() == Some(id.as_str())).is_some();
+    const LABEL_W: f32 = 76.0;
+    const VALUE_W: f32 = 50.0;
+    let slider = |ui: &mut Ui, value: &mut f64, range: std::ops::RangeInclusive<f64>, step: f64, text: String, enabled: bool, tip: &str| -> bool {
+        ui.spacing_mut().slider_width = (ui.available_width() - VALUE_W - 8.0).max(40.0);
+        let resp = ui.add_enabled(enabled, egui::Slider::new(value, range).step_by(step).show_value(false));
+        let resp = if tip.is_empty() {
+            resp
+        } else if enabled {
+            resp.on_hover_text(tip)
+        } else {
+            resp.on_disabled_hover_text(tip)
+        };
+        w::slot(ui, VALUE_W, Align::Max, RichText::new(text).size(SECONDARY + 1.0).color(p.secondary));
+        resp.changed()
+    };
+
+    w::subhead(ui, "Picture", Some(("Rec", true, "Adjusted by Rec: in the preview, the recording and the stream")));
+    let a = &mut lk.adjust;
+    w::field(ui, "White bal.", LABEL_W, |ui| {
+        let t = a.temperature;
+        let tip = "White balance in kelvin. 5600 K keeps the camera's color; lower is cooler, higher is warmer, as on a camera.";
+        slider(ui, &mut a.temperature, look::KELVIN, 50.0, format!("{t:.0} K"), true, tip)
+    });
+    w::field(ui, "Tint", LABEL_W, |ui| {
+        let t = a.tint;
+        slider(ui, &mut a.tint, look::TINT, 1.0, signed(t, 0, ""), true, "Green (left) to magenta (right)")
+    });
+    w::field(ui, "Exposure", LABEL_W, |ui| {
+        let e = a.exposure;
+        slider(ui, &mut a.exposure, look::EXPOSURE, 0.1, signed(e, 1, " EV"), true, "In stops, applied by Rec")
+    });
+    for (label, v) in [("Brightness", &mut a.brightness), ("Contrast", &mut a.contrast), ("Saturation", &mut a.saturation)] {
+        w::field(ui, label, LABEL_W, |ui| {
+            let x = *v;
+            slider(ui, v, look::PERCENT, 1.0, signed(x, 0, ""), true, "")
+        });
+    }
+    w::field(ui, "Sharpness", LABEL_W, |ui| {
+        let x = a.sharpness;
+        slider(ui, &mut a.sharpness, look::SHARPNESS, 0.5, signed(x, 1, ""), true, "Below 0 softens, above 0 sharpens")
+    });
+    w::field(ui, "Denoise", LABEL_W, |ui| {
+        let x = a.noise_reduction;
+        let text = if x == 0.0 { "Off".into() } else { format!("{x:.1}") };
+        slider(ui, &mut a.noise_reduction, look::NOISE, 0.5, text, true, "Noise reduction on top of the camera's own")
+    });
+    if running && hw.usb {
+        w::hint(ui, "Rec can't set shutter speed or ISO over USB. Use Exposure instead.");
+    }
+
+    // Hardware controls the camera answers for.
+    let mut hw_sets: Vec<(Control, i32)> = vec![];
+    if running && (hw.probing || !hw.controls.is_empty()) {
+        w::divider(ui);
+        w::subhead(ui, "Lens", Some(("Camera", false, "Set on the camera itself over USB")));
+        if hw.probing {
+            w::hint(ui, "Reading the camera's controls…");
+        }
+        let auto = hw.get(Control::FocusAuto).map(|c| c.range.cur != 0);
+        for c in Control::ALL {
+            let Some(cs) = hw.get(c) else { continue };
+            let r = cs.range;
+            let mut v = r.cur as f64;
+            let changed = match c {
+                Control::FocusAuto => {
+                    let mut on = r.cur != 0;
+                    let resp = w::row(ui, "Autofocus", |ui| w::switch(ui, &mut on, true));
+                    v = if on { 1.0 } else { 0.0 };
+                    resp.changed()
+                }
+                _ => {
+                    let (label, text, enabled) = match c {
+                        // 100 is 1x on cameras whose zoom starts there.
+                        Control::Zoom if r.min > 0 => ("Zoom", format!("{:.1}x", v / r.min as f64), true),
+                        Control::Zoom => ("Zoom", format!("{v:.0}"), true),
+                        Control::Roll => ("Roll", format!("{v:+.0}°").replace("+0°", "0°"), true),
+                        _ => ("Focus", format!("{v:.0}"), auto != Some(true)),
+                    };
+                    let tip = match c {
+                        Control::Focus if enabled => "Manual focus position (experimental)",
+                        Control::Focus => "Turn off autofocus to focus by hand",
+                        _ => "",
+                    };
+                    w::field(ui, label, LABEL_W, |ui| slider(ui, &mut v, r.min as f64..=r.max as f64, r.step as f64, text, enabled, tip))
+                }
+            };
+            if changed && v.round() as i32 != r.cur {
+                hw_sets.push((c, v.round() as i32));
+            }
+        }
+        if let Some(e) = &hw.error {
+            ui.add(egui::Label::new(RichText::new(e).size(SECONDARY).color(RED)).wrap());
+        }
+    }
+    for &(c, v) in &hw_sets {
+        st.uvc.set(c, v);
+        lk.hardware.insert(c, v);
+        if c == Control::FocusAuto && v != 0 {
+            lk.hardware.remove(&Control::Focus);
+        }
+    }
+
+    w::divider(ui);
+    w::subhead(ui, "Guides", Some(("Preview", false, "Shown in the preview only, never recorded or streamed")));
+    w::row(ui, "Zebras", |ui| w::switch(ui, &mut lk.zebras, true)).on_hover_text("Stripes over overexposed areas (95% and up)");
+    w::row(ui, "Thirds grid", |ui| w::switch(ui, &mut lk.grid, true));
+
+    w::divider(ui);
+    // Presets share a row: the 5600 K one takes what the 5000 K one leaves.
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 6.0;
+        let small = 64.0;
+        let presets = [("Osmo studio (5600K)", 5600.0, ui.available_width() - small - 6.0), ("5000K", 5000.0, small)];
+        for (label, k, width) in presets {
+            let tip = format!("White balance {k:.0} K, sharpness -1, autofocus, zebras and grid on; noise reduction off (Rec can't lower the camera's own). Zoom and roll stay.");
+            if ui.add(egui::Button::new(label).min_size(vec2(width, 24.0))).on_hover_text(tip).clicked() {
+                lk = lk.osmo_studio(k);
+                if running && hw.get(Control::FocusAuto).is_some() {
+                    st.uvc.set(Control::FocusAuto, 1);
+                }
+            }
+        }
+    });
+    let can_reset = lk != CameraLook::default() || (running && !hw.controls.is_empty());
+    w::row(ui, "Defaults", |ui| {
+        let tip = "Back to the camera's own picture: Rec's adjustments off, the camera's controls to their defaults, guides off";
+        if ui.add_enabled(can_reset, egui::Button::new("Reset")).on_hover_text(tip).clicked() {
+            lk = CameraLook::default();
+            if running {
+                st.uvc.reset();
+            }
+        }
+    });
+    if lk != saved {
+        s.set_look(&name, lk);
     }
 }
 
@@ -1033,10 +1284,23 @@ fn settings_form(ui: &mut Ui, st: &mut State) {
         cams.extend(st.cameras.iter().map(|d| (Some(d.id.clone()), d.name.clone())));
         combo(ui, "cam2", &mut s.camera, &cams, true);
         ui.end_row();
+        ui.label("Resolution");
+        let opts: Vec<(CamResolution, String)> = CamResolution::ALL.iter().map(|r| (*r, format!("{} (the camera's closest)", r.label()))).collect();
+        combo(ui, "cam-res", &mut s.camera_resolution, &opts, true);
+        ui.end_row();
+        ui.label("");
+        ui.label(RichText::new("Adjust the picture in the main window, under Camera Adjustments.").size(SECONDARY).color(theme::pal(ui).secondary));
+        ui.end_row();
     });
     ui.add_space(12.0);
     if ui.button("Restore Defaults").clicked() {
-        s = crate::settings::Settings { output_dir: s.output_dir.clone(), stream_dests: s.stream_dests.clone(), ..Default::default() };
+        // Each camera's picture settings have their own Reset.
+        s = crate::settings::Settings {
+            output_dir: s.output_dir.clone(),
+            stream_dests: s.stream_dests.clone(),
+            camera_looks: s.camera_looks.clone(),
+            ..Default::default()
+        };
     }
     if s != st.settings {
         st.settings = s;
@@ -1047,6 +1311,53 @@ fn settings_form(ui: &mut Ui, st: &mut State) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The light segments `thirds` draws for a 300x180 camera at (10, 20).
+    fn grid_lines(shape: Shape) -> Vec<[egui::Pos2; 2]> {
+        let ctx = egui::Context::default();
+        let r = egui::Rect::from_min_size(egui::pos2(10.0, 20.0), vec2(300.0, 180.0));
+        let input = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, vec2(400.0, 300.0))), ..Default::default() };
+        let mut out = ctx.run_ui(input, |ui| thirds(ui, r, shape, 0.5));
+        out.textures_delta.clear();
+        out.shapes
+            .iter()
+            .filter_map(|c| match &c.shape {
+                egui::Shape::LineSegment { points, stroke } if stroke.color == Color32::from_white_alpha(140) => Some(*points),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Rule-of-thirds lines sit at a third and two thirds of the camera's
+    /// rectangle, and stay inside a round overlay.
+    #[test]
+    fn thirds_grid() {
+        let lines = grid_lines(Shape::Rect);
+        assert_eq!(lines.len(), 4);
+        let near = |a: f32, b: f32| (a - b).abs() < 0.01;
+        let verticals: Vec<f32> = lines.iter().filter(|p| near(p[0].x, p[1].x)).map(|p| p[0].x).collect();
+        let horizontals: Vec<f32> = lines.iter().filter(|p| near(p[0].y, p[1].y)).map(|p| p[0].y).collect();
+        assert!(verticals.iter().any(|&x| near(x, 110.0)) && verticals.iter().any(|&x| near(x, 210.0)), "{verticals:?}");
+        assert!(horizontals.iter().any(|&y| near(y, 80.0)) && horizontals.iter().any(|&y| near(y, 140.0)), "{horizontals:?}");
+        for p in &lines {
+            let len = (p[1] - p[0]).length();
+            assert!(near(len, 180.0) || near(len, 300.0), "full-length lines: {p:?}");
+        }
+        // In a circle the lines are chords: shorter, still inside the box.
+        for p in grid_lines(Shape::Circle) {
+            let (len, full) = ((p[1] - p[0]).length(), if near(p[0].x, p[1].x) { 180.0 } else { 300.0 });
+            assert!(len > 0.5 * full && len < full - 10.0, "{p:?}");
+            assert!(p.iter().all(|q| q.x >= 10.0 && q.x <= 310.0 && q.y >= 20.0 && q.y <= 200.0), "{p:?}");
+        }
+    }
+
+    #[test]
+    fn camera_slider_values() {
+        assert_eq!(signed(0.0, 0, ""), "0");
+        assert_eq!(signed(-0.04, 1, " EV"), "0 EV");
+        assert_eq!(signed(0.3, 1, " EV"), "+0.3 EV");
+        assert_eq!(signed(-12.0, 0, ""), "-12");
+    }
 
     #[test]
     fn levels_as_text_and_typed() {
