@@ -1591,7 +1591,15 @@ mod tests {
             let t = unsafe { CMTime::new(1000 * 30 + i, 30) };
             s.push_cam(t, frame(64, 36), crate::bars::Bars::NONE);
             s.push_screen(t, frame(64, 36));
-            s.emit_until(1000.0 + i as f64 / 30.0);
+            // The encoders run in real time and the frames come much faster:
+            // give them a moment to take each slot, as the pacer would.
+            for _ in 0..500 {
+                s.emit_until(1000.0 + i as f64 / 30.0);
+                if s.next_slot > i || s.failed.is_some() {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
         }
         // Just before the next slot, so `dur` covers exactly n slots.
         s.finish(1000.0 + dur - 0.01)
