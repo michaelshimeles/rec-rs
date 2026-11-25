@@ -2685,7 +2685,7 @@ dependencies = [
 
 [[package]]
 name = "rec-rs"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "anyhow",
  "block2 0.6.2",

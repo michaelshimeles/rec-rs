@@ -1,6 +1,6 @@
 export const SITE_URL = 'https://rec.rasmic.xyz';
 
-export const VERSION = '0.1.2';
+export const VERSION = '0.1.3';
 export const ARCH = 'Apple Silicon and Intel';
 export const MIN_MACOS = '15';
 
