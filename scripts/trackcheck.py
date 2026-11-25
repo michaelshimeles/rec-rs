@@ -203,9 +203,17 @@ def main():
             print(f"camera frames from inside a pause, shown until the next one: {held}")
         cam_frames = len({c for c in c_ticks if c is not None})
         dur = n / fps
+        # The 30 fps camera grid lines up with the file's at 30, 60 or 120
+        # fps: each camera frame then shows in the slot of its capture. At
+        # other rates (24, 25, 50) a slot shows the newest camera frame up
+        # to half a slot after it, so the offset ranges over about a slot,
+        # and below 30 fps some camera frames never show.
+        aligned = abs(fps / 30 - round(fps / 30)) < 1e-9 and fps >= 30
+        lo, hi = (-a.max_ms, a.max_ms) if aligned else (-1000 / fps - a.max_ms, 500 / fps + a.max_ms)
+        want_frames = round(dur * min(30, fps))
         start = [o for t, o in fresh if t < a.window]
         end = [o for t, o in fresh if t >= dur - a.window]
-        print(f"camera frames: {cam_frames} distinct (about {dur * 30:.0f} expected at 30 fps)")
+        print(f"camera frames: {cam_frames} distinct (about {want_frames} expected from a 30 fps camera at {fps:g} fps)")
         print(f"offset, camera minus screen, where each camera frame first shows:")
         print(f"  first {a.window:g} s: {stats(start)}")
         print(f"  last {a.window:g} s:  {stats(end)}")
@@ -218,9 +226,11 @@ def main():
         result.update(camera_distinct_frames=cam_frames, offset_start_ms=mean(start), offset_end_ms=mean(end),
                       offset_max_ms=max((abs(o) for _, o in fresh), default=None), drift_ms=drift,
                       mirrored=mirrored)
-        check(cam_frames >= round(dur * 30) - 1, "no camera frames lost")
-        check(fresh and max(abs(o) for _, o in fresh) <= a.max_ms,
-              f"every camera frame within {a.max_ms:g} ms of the screen")
+        check(cam_frames >= want_frames - 1, "no camera frames lost")
+        check(fresh and all(lo <= o <= hi for _, o in fresh),
+              f"every camera frame within {lo:+.1f} to {hi:+.1f} ms of its slot"
+              + ("" if aligned else f" (camera and {fps:g} fps grids don't line up)"))
+        check(abs(drift) <= (a.max_ms if aligned else 2 * a.max_ms), f"no drift ({drift:+.3f} ms)")
 
     # The same audio in both files: beeps (the test pattern's, or claps)
     # at the same instants, at the start and the end.

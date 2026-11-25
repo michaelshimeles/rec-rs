@@ -219,7 +219,8 @@ max in % of one core, and its peak memory. 1080p60 H.264.
 - The test sources are drawn in software inside the recorder, so that column runs higher than
   with a real screen.
 - On this shared machine the numbers move between runs: the 10-minute take with all three files
-  averaged 56.4%, the 60 s take 46.1%.
+  averaged 56.4%, the 60 s take 46.1%. After the review fixes, a repeat of the 60 s separate
+  take used 31.4% / 35.5% and again passed `trackcheck.py --strict` at 0.000 ms.
 
 ### A stall seen once
 

@@ -93,7 +93,7 @@ fn draw(pb: &CVPixelBuffer, n: u64, fps: u64, ticks: i64, noise: bool, rng: &mut
                     *px = if flash { 128 } else if i % 2 == 0 { 100 + (y % 56) as u8 } else { 150 };
                 }
             }
-            code_rects(w, ticks, |x, y, cw, ch, on| {
+            code_rects(w, h, ticks, |x, y, cw, ch, on| {
                 for row in y..y + ch {
                     std::ptr::write_bytes(y_base.add(row * y_stride + x), if on { 235 } else { 16 }, cw);
                 }
@@ -117,7 +117,7 @@ fn draw(pb: &CVPixelBuffer, n: u64, fps: u64, ticks: i64, noise: bool, rng: &mut
                     };
                 }
             }
-            fill_code_bgra(base, stride, (0, 0), w, ticks);
+            fill_code_bgra(base, stride, (0, 0), (w, h), ticks);
         }
         CVPixelBufferUnlockBaseAddress(pb, CVPixelBufferLockFlags(0));
     }
@@ -146,20 +146,24 @@ pub fn code_bits(ticks: i64) -> [bool; CODE_BLOCKS] {
     b
 }
 
-/// Each block of the code for `ticks` in a picture `w` wide, as
+/// Each block of the code for `ticks` in a `w`x`h` picture, as
 /// (x, y, width, height, white) from the picture's top-left: one block in
-/// from the left and the top, two blocks tall.
-fn code_rects(w: usize, ticks: i64, mut f: impl FnMut(usize, usize, usize, usize, bool)) {
+/// from the left and the top, two blocks tall. Nothing when the code
+/// doesn't fit (a frame of a few pixels).
+fn code_rects(w: usize, h: usize, ticks: i64, mut f: impl FnMut(usize, usize, usize, usize, bool)) {
     let b = code_block(w);
+    if (CODE_BLOCKS + 1) * b > w || 3 * b > h {
+        return;
+    }
     for (i, on) in code_bits(ticks).into_iter().enumerate() {
         f(b + i * b, b, b, 2 * b, on);
     }
 }
 
-/// Draw the code for `ticks` into BGRA pixels at `base`, in a picture `w`
-/// wide whose top-left corner is at `at`.
-unsafe fn fill_code_bgra(base: *mut u8, stride: usize, at: (usize, usize), w: usize, ticks: i64) {
-    code_rects(w, ticks, |x, y, cw, ch, on| {
+/// Draw the code for `ticks` into BGRA pixels at `base`, in a picture of
+/// `size` whose top-left corner is at `at`.
+unsafe fn fill_code_bgra(base: *mut u8, stride: usize, at: (usize, usize), size: (usize, usize), ticks: i64) {
+    code_rects(size.0, size.1, ticks, |x, y, cw, ch, on| {
         for row in at.1 + y..at.1 + y + ch {
             let px = unsafe { std::slice::from_raw_parts_mut(base.add(row * stride + (at.0 + x) * 4) as *mut u32, cw) };
             px.fill(if on { 0xffff_ffff } else { 0xff00_0000 });
@@ -295,7 +299,7 @@ fn draw_camera(pb: &CVPixelBuffer, pic: (usize, usize, usize, usize), background
                 row[a..b].fill(0xfff0_9628);
             }
         }
-        fill_code_bgra(base, stride, (px, py), pw, ticks);
+        fill_code_bgra(base, stride, (px, py), (pw, ph), ticks);
         CVPixelBufferUnlockBaseAddress(pb, CVPixelBufferLockFlags(0));
     }
 }
@@ -386,6 +390,15 @@ mod tests {
         };
         (bits[..3] == [true, true, false] && !bits[CODE_BLOCKS - 1])
             .then(|| bits[3..3 + CODE_BITS].iter().fold(0u32, |v, &on| v << 1 | on as u32))
+    }
+
+    #[test]
+    fn time_code_stays_inside_the_frame() {
+        for (w, h) in [(2, 2), (64, 36), (148, 12), (320, 180), (720, 400), (1920, 1080)] {
+            code_rects(w, h, 123_456, |x, y, cw, ch, _| {
+                assert!(x + cw <= w && y + ch <= h, "{w}x{h}: block at {x},{y} {cw}x{ch} is outside");
+            });
+        }
     }
 
     #[test]

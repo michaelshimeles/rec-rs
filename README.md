@@ -404,8 +404,11 @@ the same time. Edit them apart later: move, resize or cut the camera in an edito
   frame grid. Each frame slot goes to every file with the same timestamp. The files start on
   the same instant and have the same number of frames and the same length. A pause cuts the same
   slots from all of them. If one file's encoder can't take a frame, Rec drops that slot from all
-  of them. Put both files at the same point on an editor's timeline and they line up. They also
-  carry the same audio, so an editor that syncs clips by waveform lines them up too.
+  of them. If a file refuses a frame the others took, the recording stops with an error and
+  keeps the files. Put both files at the same point on an editor's timeline and they line up.
+  They also carry the same audio, so an editor that syncs clips by waveform lines them up too.
+  An audio track that refuses a buffer gets that much silence before its next one, so it keeps
+  its timing. The composed video does the same.
 - **Measured.** The test sources draw each frame's capture time into the picture, and
   `scripts/trackcheck.py` reads it back from both files. Over a 10-minute take the screen and the
   camera were 0.000 ms apart at the start and at the end, and no frame was lost. See

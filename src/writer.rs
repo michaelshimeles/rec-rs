@@ -218,6 +218,46 @@ struct Out {
     sys: Option<Retained<AVAssetWriterInput>>,
     mic: Option<Retained<AVAssetWriterInput>>,
     mix_input: Option<Retained<AVAssetWriterInput>>,
+    /// Seconds of audio each track [system, mic, mix] refused and still
+    /// owes (see `append_audio`).
+    owed: [std::cell::Cell<f64>; 3],
+}
+
+impl Out {
+    /// Audio track `k`: 0 system, 1 mic, 2 mix.
+    fn track(&self, k: usize) -> Option<&AVAssetWriterInput> {
+        [&self.sys, &self.mic, &self.mix_input][k].as_deref()
+    }
+}
+
+/// Append audio buffer `b` to track `k` of `o`. AVAssetWriter lays a
+/// track's buffers end to end, so one the track refuses (input busy) would
+/// pull everything after it earlier, in that file only. The track owes it
+/// instead and gets that much silence before its next buffer.
+fn append_audio(o: &Out, k: usize, b: &CMSampleBuffer) -> bool {
+    let Some(input) = o.track(k) else { return true };
+    unsafe {
+        let n = b.num_samples().max(0) as f64;
+        let rate = b
+            .format_description()
+            .and_then(|f| objc2_core_media::CMAudioFormatDescriptionGetStreamBasicDescription(&f).as_ref().map(|d| d.mSampleRate))
+            .filter(|r| *r > 0.0)
+            .unwrap_or(48000.0);
+        let owed = o.owed[k].get();
+        let mut ok = input.isReadyForMoreMediaData();
+        if ok && owed > 0.0 {
+            let at = b.presentation_time_stamp().subtract(CMTime::new((owed * TIMESCALE as f64).round() as i64, TIMESCALE));
+            ok = silence_like(b, (owed * rate).round() as usize, at).is_some_and(|s| input.appendSampleBuffer(&s));
+            if ok {
+                o.owed[k].set(0.0);
+            }
+        }
+        ok = ok && input.isReadyForMoreMediaData() && input.appendSampleBuffer(b);
+        if !ok {
+            o.owed[k].set(o.owed[k].get() + n / rate);
+        }
+        ok
+    }
 }
 
 /// The screen and the camera in files of their own (`--separate`), on
@@ -615,26 +655,36 @@ impl Sink {
         }
     }
 
-    /// Write slot `pts` to the screen's and the camera's files: `screen` as
-    /// it is (at the output size), the camera frame drawn for its file.
-    fn write_separate_frame(&mut self, screen: Option<&CVPixelBuffer>, pts: CMTime, fresh: bool) {
+    /// The camera file's frame for the current slot, drawn into a buffer of
+    /// its own (None if the camera file isn't open or no buffer is free).
+    fn separate_cam_frame(&mut self) -> Option<CFRetained<CVPixelBuffer>> {
         let cam = self.cam_last.as_ref().map(|(b, bars)| (b.0.clone(), *bars));
-        let composed = self.out.is_some();
-        let Some(sep) = self.sep.as_mut() else { return };
-        let mut ok = [false; 2];
-        if let Some(screen) = screen {
-            ok[0] = unsafe { sep.screen.adaptor.appendPixelBuffer_withPresentationTime(screen, pts) };
-        }
-        if let Some(o) = &sep.cam.out {
-            let alloc = || {
-                let pool = unsafe { o.adaptor.pixelBufferPool() }?;
-                let mut buf = std::ptr::null_mut();
-                unsafe { CVPixelBufferPool::create_pixel_buffer(None, &pool, std::ptr::NonNull::from(&mut buf)) };
-                std::ptr::NonNull::new(buf).map(|b| unsafe { CFRetained::from_raw(b) })
-            };
-            let frame = sep.cam.render.frame(cam.as_ref().map(|(b, bars)| (b, *bars)), sep.cam.mirror, alloc);
-            ok[1] = frame.is_some_and(|f| unsafe { o.adaptor.appendPixelBuffer_withPresentationTime(&f, pts) });
-        }
+        let c = &mut self.sep.as_mut()?.cam;
+        let o = c.out.as_ref()?;
+        let alloc = || {
+            let pool = unsafe { o.adaptor.pixelBufferPool() }?;
+            let mut buf = std::ptr::null_mut();
+            unsafe { CVPixelBufferPool::create_pixel_buffer(None, &pool, std::ptr::NonNull::from(&mut buf)) };
+            std::ptr::NonNull::new(buf).map(|b| unsafe { CFRetained::from_raw(b) })
+        };
+        c.render.frame(cam.as_ref().map(|(b, bars)| (b, *bars)), c.mirror, alloc)
+    }
+
+    /// Write slot `pts` to the screen's file (`screen`, at the output size)
+    /// and the camera's (`cam`, from `separate_cam_frame`). `composed` is
+    /// whether the composed file took the slot, if there is one. Every file
+    /// takes the slot or none does: a file that refuses a frame the others
+    /// took would no longer match them, so that fails the recording.
+    fn write_separate_frame(&mut self, screen: &CVPixelBuffer, cam: &CVPixelBuffer, pts: CMTime, fresh: bool, composed: Option<bool>) {
+        let Some(sep) = &self.sep else { return };
+        let Some(cam_out) = &sep.cam.out else { return };
+        let ok = unsafe {
+            [
+                sep.screen.adaptor.appendPixelBuffer_withPresentationTime(screen, pts),
+                cam_out.adaptor.appendPixelBuffer_withPresentationTime(cam, pts),
+            ]
+        };
+        let refused = [(&sep.screen.path, ok[0]), (&cam_out.path, ok[1])].into_iter().find(|(_, ok)| !ok).map(|(p, _)| file_name(p));
         for (i, ok) in ok.into_iter().enumerate() {
             if ok {
                 self.stats.separate_frames[i] += 1;
@@ -643,14 +693,20 @@ impl Sink {
             }
         }
         // Without the composed file, the screen's file is the recording.
-        if !composed && ok[0] {
+        if composed.is_none() && ok[0] {
             self.stats.video_frames_out += 1;
             if !fresh {
                 self.stats.video_dups += 1;
             }
         }
-        if !ok.iter().all(|&o| o) {
-            self.check_writer();
+        let all: Vec<bool> = composed.into_iter().chain(ok).collect();
+        if all.iter().all(|&o| o) {
+            return;
+        }
+        self.check_writer();
+        if self.failed.is_none() && all.iter().any(|&o| o) {
+            let name = refused.unwrap_or_else(|| self.out.as_ref().map(|o| file_name(&o.path)).unwrap_or_default());
+            self.failed = Some(format!("{name} refused a frame the other files took"));
         }
     }
 
@@ -825,15 +881,9 @@ impl Sink {
             m.push(kind, out_s, rate, frames[i0.min(frames.len())..i1.min(frames.len())].to_vec());
             self.drain_mix(false);
         }
-        // This source's track in every file that has one.
-        let inputs: Vec<Retained<AVAssetWriterInput>> = self
-            .outs()
-            .filter_map(|o| match kind {
-                AudioKind::System => o.sys.clone(),
-                AudioKind::Mic => o.mic.clone(),
-            })
-            .collect();
-        if inputs.is_empty() {
+        // This source's track, in every file that has one.
+        let k = (kind == AudioKind::Mic) as usize;
+        if !self.outs().any(|o| o.track(k).is_some()) {
             return;
         }
         // The track gets the faded audio in the device's own format.
@@ -889,10 +939,7 @@ impl Sink {
         }
         self.audio_next[i] = Some(body_start + (i1 - i0) as f64 / rate);
         for b in bufs {
-            let mut ok = true;
-            for input in &inputs {
-                ok &= unsafe { input.isReadyForMoreMediaData() && input.appendSampleBuffer(&b) };
-            }
+            let ok = self.outs().fold(true, |ok, o| append_audio(o, k, &b) & ok);
             if ok {
                 match kind {
                     AudioKind::System => self.stats.audio_sys_buffers += 1,
@@ -906,23 +953,22 @@ impl Sink {
     }
 
     fn drain_mix(&mut self, flush: bool) {
-        let inputs: Vec<Retained<AVAssetWriterInput>> = self.outs().filter_map(|o| o.mix_input.clone()).collect();
-        if inputs.is_empty() {
+        if !self.outs().any(|o| o.mix_input.is_some()) {
             return;
         }
         let Some(m) = self.mixer.as_mut() else { return };
+        let mut bufs = vec![];
         while let Some(buf) = m.pull(flush) {
-            let mut ok = true;
-            for input in &inputs {
-                ok &= unsafe { input.isReadyForMoreMediaData() && input.appendSampleBuffer(&buf) };
-            }
-            if ok {
+            bufs.push(buf);
+        }
+        self.stats.audio_clipped_samples = m.clipped;
+        for buf in bufs {
+            if self.outs().fold(true, |ok, o| append_audio(o, 2, &buf) & ok) {
                 self.stats.audio_mix_buffers += 1;
             } else {
                 self.stats.audio_drops += 1;
             }
         }
-        self.stats.audio_clipped_samples = m.clipped;
         self.check_writer();
     }
 
@@ -1041,6 +1087,22 @@ impl Sink {
                     continue;
                 }
             }
+            // With separate files, their frames are ready before any file
+            // takes the slot, so the slot goes to all of them or to none.
+            let cam_frame = if write && self.sep.is_some() {
+                let f = if screen.is_some() { self.separate_cam_frame() } else { None };
+                if f.is_none() {
+                    self.stats.video_drops += 1;
+                    self.out_slot += 1;
+                    write = false;
+                    if !want_preview && !want_live {
+                        continue;
+                    }
+                }
+                f
+            } else {
+                None
+            };
             // The scene, composed: for the composed file, the preview and the
             // live encode (only for those two with separate files alone).
             let compose = self.out.is_some() || self.sep.is_none() || want_preview || want_live;
@@ -1078,8 +1140,10 @@ impl Sink {
             if write {
                 let pts = unsafe { CMTime::new(self.slot_ticks(self.out_slot), TIMESCALE) };
                 self.out_slot += 1;
+                let mut composed = None;
                 if let (Some(o), Some(frame)) = (&self.out, &frame) {
-                    if unsafe { o.adaptor.appendPixelBuffer_withPresentationTime(frame, pts) } {
+                    let ok = unsafe { o.adaptor.appendPixelBuffer_withPresentationTime(frame, pts) };
+                    if ok {
                         self.stats.video_frames_out += 1;
                         if !fresh {
                             self.stats.video_dups += 1;
@@ -1088,11 +1152,12 @@ impl Sink {
                         self.stats.video_drops += 1;
                         self.check_writer();
                     }
+                    composed = Some(ok);
                 } else if self.sep.is_none() {
                     self.stats.video_frames_out += 1;
                 }
-                if self.sep.is_some() {
-                    self.write_separate_frame(screen.as_deref(), pts, fresh);
+                if let (Some(screen), Some(cam)) = (screen.as_deref(), cam_frame.as_deref()) {
+                    self.write_separate_frame(screen, cam, pts, fresh, composed);
                 }
             }
             if want_live && let (Some(l), Some(frame)) = (&self.live, &frame) {
@@ -1164,6 +1229,12 @@ impl Sink {
         }
         if !failures.is_empty() {
             bail!("writing failed: {}", failures.join("; "));
+        }
+        // A failure that left the files that opened intact (the camera's
+        // file couldn't open, a file refused a frame): they are finished
+        // and kept, and the recording still reports the failure.
+        if let Some(e) = self.failed.take() {
+            bail!("{e} (the other files were saved)");
         }
         Ok(self.stats.clone())
     }
@@ -1248,7 +1319,7 @@ fn open_output(path: &Path, v: &VideoSpec, system_audio: bool, mic: bool, layout
         if !writer.startWriting() {
             bail!("startWriting failed: {}", err_text(&writer));
         }
-        Ok(Out { path: path.to_path_buf(), writer, video, adaptor, sys, mic, mix_input })
+        Ok(Out { path: path.to_path_buf(), writer, video, adaptor, sys, mic, mix_input, owed: Default::default() })
     }
 }
 
@@ -1495,6 +1566,61 @@ mod tests {
         let cur = ids[&(CFRetained::as_ptr(&last.as_ref().unwrap().0).as_ptr() as usize)];
         assert_eq!(cur, 2, "current frame stays due, later ones are skipped");
         assert_eq!(q.len(), 4);
+    }
+
+    /// A BGRA test frame.
+    fn frame(w: usize, h: usize) -> objc2_core_foundation::CFRetained<objc2_core_video::CVPixelBuffer> {
+        let pool = crate::util::make_pool(w, h, crate::util::PIX_BGRA);
+        let mut buf = std::ptr::null_mut();
+        unsafe { objc2_core_video::CVPixelBufferPool::create_pixel_buffer(None, &pool, std::ptr::NonNull::from(&mut buf)) };
+        unsafe { objc2_core_foundation::CFRetained::from_raw(std::ptr::NonNull::new(buf).unwrap()) }
+    }
+
+    /// Separate files on a 64x36 composited session, writing to `screen`
+    /// and `cam`, fed screen and camera frames for `dur` seconds from
+    /// t = 1000 s.
+    fn separate_take(screen: &std::path::Path, cam: &std::path::Path, dur: f64) -> anyhow::Result<super::Stats> {
+        use super::*;
+        let v = VideoSpec { width: 64, height: 36, fps: 30, codec: Codec::H264, bitrate: 1_000_000, pixel_format: crate::util::PIX_BGRA };
+        let comp = crate::compose::Compositor::new(64, 36, Default::default());
+        let vols = [Volume { db: 0.0, muted: false }; 2];
+        let mut s = Sink::new(None, &v, false, false, AudioLayout::Both, vols, Some(comp), Scene::ScreenCam, None)?;
+        s.write_separate(screen, cam, &v, AudioLayout::Both, false)?;
+        let n = (dur * 30.0) as i64;
+        for i in 0..n {
+            let t = unsafe { CMTime::new(1000 * 30 + i, 30) };
+            s.push_cam(t, frame(64, 36), crate::bars::Bars::NONE);
+            s.push_screen(t, frame(64, 36));
+            s.emit_until(1000.0 + i as f64 / 30.0);
+        }
+        // Just before the next slot, so `dur` covers exactly n slots.
+        s.finish(1000.0 + dur - 0.01)
+    }
+
+    #[test]
+    fn separate_files_have_the_same_frames() {
+        let dir = std::env::temp_dir().join(format!("rec-sep-ok-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (screen, cam) = (dir.join("t-screen.mov"), dir.join("t-camera.mov"));
+        let st = separate_take(&screen, &cam, 1.0).unwrap();
+        assert_eq!(st.separate_frames, [30, 30]);
+        assert!(screen.exists() && cam.exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A camera file that can't be written fails the recording, after the
+    /// screen's file is finished and kept.
+    #[test]
+    fn a_camera_file_that_cannot_open_fails_the_recording() {
+        let dir = std::env::temp_dir().join(format!("rec-sep-fail-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let screen = dir.join("t-screen.mov");
+        let cam = dir.join("no-such-folder/t-camera.mov");
+        let r = separate_take(&screen, &cam, 1.0);
+        let err = r.err().map(|e| format!("{e:#}"));
+        assert!(err.as_deref().is_some_and(|e| e.contains("camera file")), "finish returned {err:?}");
+        assert!(screen.exists(), "the screen's file is kept");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
