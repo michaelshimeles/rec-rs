@@ -10,6 +10,10 @@ npm run build
 npm run preview   # serves the production build, including /download
 ```
 
+The site needs Node 24. `package.json` sets `engines.node` to `24.x`, and the Vercel adapter
+uses the `nodejs24.x` runtime, so a Vercel build stays on 24. An open range such as
+`>=22.17` made Vercel pick Node 26, which `@sveltejs/adapter-vercel` rejects.
+
 `npm install` and the build write `node_modules/`, `.svelte-kit/` and `.vercel/` into this
 folder. The repo is synced between machines (Mutagen), so run them in a clone or worktree
 outside the synced checkout.
