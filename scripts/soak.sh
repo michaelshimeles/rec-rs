@@ -58,5 +58,7 @@ if cpu:
     print(f"memory    : first-quarter mean {sum(rss[:q])/q:.0f} MB, last-quarter mean {sum(rss[-q:])/q:.0f} MB, max {max(rss):.0f} MB")
 PY
 for f in "$F" "${F%.mov}-screen.mov" "${F%.mov}-camera.mov"; do
-  [ -e "$f" ] && dist/rec-rs probe "$f" | head -4
+  if [ -e "$f" ]; then
+    dist/rec-rs probe "$f" | head -4
+  fi
 done
