@@ -292,7 +292,7 @@ fn box_blur(src: &[f32], dst: &mut [f32], w: usize, h: usize, r: usize, horizont
 }
 
 /// Premultiplied BGRA image of `color` with per-pixel `alpha`.
-fn alpha_image(alpha: &[u8], w: usize, h: usize, color: [u8; 3]) -> Retained<CIImage> {
+pub fn alpha_image(alpha: &[u8], w: usize, h: usize, color: [u8; 3]) -> Retained<CIImage> {
     let mut px = Vec::with_capacity(w * h * 4);
     for &a in alpha {
         let m = |c: u8| ((c as u32 * a as u32 + 127) / 255) as u8;
@@ -350,7 +350,7 @@ impl Decor {
 }
 
 /// Border width in output pixels.
-fn border_px(pip: &PipSpec, out_h: f64) -> f64 {
+pub fn border_px(pip: &PipSpec, out_h: f64) -> f64 {
     (pip.border.max(0.0) * out_h / 1080.0).round()
 }
 
@@ -425,6 +425,9 @@ pub struct Compositor {
     decor: Option<Decor>,
     /// Aspect ratio of the last camera frame (16:9 until one arrives).
     cam_aspect: f64,
+    /// Software adjustments to the camera picture (`look`); empty when
+    /// they are neutral.
+    adjust: Vec<crate::look::Step>,
 }
 
 fn rect(x: f64, y: f64, w: f64, h: f64) -> CGRect {
@@ -441,7 +444,7 @@ impl Compositor {
             let opts = dict(vec![(&*ns("kCIContextCacheIntermediates"), num_b(false))]);
             let ctx = CIContext::contextWithOptions(Some(&opts));
             let cs = CGColorSpace::with_name(Some(kCGColorSpaceSRGB)).expect("sRGB colorspace");
-            Compositor { ctx, cs, w: width as f64, h: height as f64, pip, decor: None, cam_aspect: 16.0 / 9.0 }
+            Compositor { ctx, cs, w: width as f64, h: height as f64, pip, decor: None, cam_aspect: 16.0 / 9.0, adjust: vec![] }
         }
     }
 
@@ -452,6 +455,12 @@ impl Compositor {
 
     pub fn cam_aspect(&self) -> f64 {
         self.cam_aspect
+    }
+
+    /// Change the camera's software adjustments live. Neutral ones remove
+    /// every filter.
+    pub fn set_adjust(&mut self, adjust: &crate::look::Adjust) {
+        self.adjust = adjust.steps();
     }
 
     fn decor(&mut self, w: usize, h: usize) -> &Decor {
@@ -468,16 +477,17 @@ impl Compositor {
         unsafe {
             let canvas = rect(0.0, 0.0, self.w, self.h);
             let black = CIImage::imageWithColor(&CIColor::colorWithRed_green_blue(0.0, 0.0, 0.0)).imageByCroppingToRect(canvas);
-            // The camera's picture without its bars. Its extent's origin is
-            // then off zero, and the placements below account for that.
+            // The camera's picture without its bars, then adjusted. Its
+            // extent's origin is then off zero, and the placements below
+            // account for that.
             let cam = cam.map(|(c, bars)| {
-                let img = CIImage::imageWithCVPixelBuffer(c);
-                if bars.is_none() {
-                    return img;
+                let mut img = CIImage::imageWithCVPixelBuffer(c);
+                if !bars.is_none() {
+                    let e = img.extent();
+                    let (x, y, w, h) = bars.picture(e.size.width, e.size.height);
+                    img = img.imageByCroppingToRect(rect(x, y, w, h));
                 }
-                let e = img.extent();
-                let (x, y, w, h) = bars.picture(e.size.width, e.size.height);
-                img.imageByCroppingToRect(rect(x, y, w, h))
+                if self.adjust.is_empty() { img } else { crate::look::apply(&img, &self.adjust) }
             });
             if let Some(c) = &cam {
                 let e = c.extent();
@@ -536,7 +546,7 @@ impl Compositor {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     #[test]
@@ -746,7 +756,7 @@ mod tests {
     }
 
     /// With REC_EVIDENCE_DIR set, save `b` there as `<name>.png` (needs ffmpeg).
-    fn save_png(b: &CVPixelBuffer, name: &str) {
+    pub(crate) fn save_png(b: &CVPixelBuffer, name: &str) {
         use objc2_core_video::*;
         let Some(dir) = std::env::var_os("REC_EVIDENCE_DIR") else { return };
         let dir = std::path::PathBuf::from(dir);
@@ -771,6 +781,248 @@ mod tests {
             .is_ok_and(|s| s.success());
         std::fs::remove_file(&tmp).unwrap();
         assert!(ok, "ffmpeg could not write {name}.png");
+    }
+
+    /// Every BGRA byte of `b`, row by row without padding.
+    fn bytes(b: &CVPixelBuffer) -> Vec<u8> {
+        use objc2_core_video::*;
+        let (w, h) = (CVPixelBufferGetWidth(b), CVPixelBufferGetHeight(b));
+        let mut v = Vec::with_capacity(w * h * 4);
+        unsafe {
+            CVPixelBufferLockBaseAddress(b, CVPixelBufferLockFlags::ReadOnly);
+            let base = CVPixelBufferGetBaseAddress(b) as *const u8;
+            for y in 0..h {
+                v.extend_from_slice(std::slice::from_raw_parts(base.add(y * CVPixelBufferGetBytesPerRow(b)), w * 4));
+            }
+            CVPixelBufferUnlockBaseAddress(b, CVPixelBufferLockFlags::ReadOnly);
+        }
+        v
+    }
+
+    /// A camera frame with color, detail and edges: a gradient with stripes.
+    pub(crate) fn busy_cam(w: usize, h: usize) -> CFRetained<CVPixelBuffer> {
+        paint(w, h, |x, y| {
+            let stripe = if (x / 3) % 2 == 0 { 30 } else { 0 };
+            [(40 + y * 150 / h) as u8, (60 + stripe + x * 100 / w) as u8, (200 - x * 120 / w) as u8, 255]
+        })
+    }
+
+    /// Neutral adjustments are a true no-op: the frame is byte for byte what
+    /// it was before adjustments existed, including after turning them off.
+    #[test]
+    fn neutral_adjustments_leave_the_frame_untouched() {
+        use crate::look::Adjust;
+        let (w, h) = (640, 360);
+        let screen = paint(w, h, |x, _| [x as u8, 90, 160, 255]);
+        let cam = busy_cam(320, 180);
+        for scene in [Scene::ScreenCam, Scene::Cam] {
+            let plain = paint(w, h, |_, _| [0, 255, 0, 255]);
+            Compositor::new(w, h, PipSpec::default()).render(scene, Some(&screen), Some((&cam, Bars::NONE)), &plain);
+            let mut c = Compositor::new(w, h, PipSpec::default());
+            c.set_adjust(&Adjust { temperature: 3200.0, sharpness: 2.0, noise_reduction: 1.0, ..Adjust::NEUTRAL });
+            let adjusted = paint(w, h, |_, _| [0, 255, 0, 255]);
+            c.render(scene, Some(&screen), Some((&cam, Bars::NONE)), &adjusted);
+            assert_ne!(bytes(&plain), bytes(&adjusted), "{scene:?}: the adjustments do something");
+            c.set_adjust(&Adjust::NEUTRAL);
+            let back = paint(w, h, |_, _| [0, 255, 0, 255]);
+            c.render(scene, Some(&screen), Some((&cam, Bars::NONE)), &back);
+            assert!(bytes(&plain) == bytes(&back), "{scene:?}: neutral is identical to no adjustments");
+        }
+    }
+
+    /// The adjustments reach the composited frame (the one the preview
+    /// shows and the file records), in the expected direction.
+    #[test]
+    fn adjustments_change_the_composited_frame() {
+        use crate::look::Adjust;
+        let (w, h) = (320, 180);
+        let gray = paint(160, 90, |_, _| [128, 128, 128, 255]);
+        let center = |a: Adjust, cam: &CVPixelBuffer| {
+            let out = paint(w, h, |_, _| [0, 0, 0, 255]);
+            let mut c = Compositor::new(w, h, PipSpec::default());
+            c.set_adjust(&a);
+            c.render(Scene::Cam, None, Some((cam, Bars::NONE)), &out);
+            pixel(&out, w / 2, h / 2)
+        };
+        let n = center(Adjust::NEUTRAL, &gray);
+        assert!(n.iter().all(|&v| (125..=131).contains(&v)), "neutral gray: {n:?}");
+        // White balance set lower than the light: cooler (blue over red).
+        let cool = center(Adjust { temperature: 3200.0, ..Adjust::NEUTRAL }, &gray);
+        assert!(cool[0] as i32 - cool[2] as i32 > 40, "3200 K: {cool:?}");
+        let warm = center(Adjust { temperature: 9000.0, ..Adjust::NEUTRAL }, &gray);
+        assert!(warm[2] as i32 - warm[0] as i32 > 20, "9000 K: {warm:?}");
+        let magenta = center(Adjust { tint: 60.0, ..Adjust::NEUTRAL }, &gray);
+        assert!(magenta[1] + 10 < magenta[0] && magenta[1] + 10 < magenta[2], "tint +60: {magenta:?}");
+        // A stop up is brighter, a stop down darker.
+        let up = center(Adjust { exposure: 1.0, ..Adjust::NEUTRAL }, &gray);
+        let down = center(Adjust { exposure: -1.0, ..Adjust::NEUTRAL }, &gray);
+        assert!(up[1] > 160 && down[1] < 100, "+1 EV {up:?}, -1 EV {down:?}");
+        let bright = center(Adjust { brightness: 50.0, ..Adjust::NEUTRAL }, &gray);
+        assert!(bright[1] > 140, "brightness +50: {bright:?}");
+        // No saturation turns color gray.
+        let orange = paint(160, 90, |_, _| [40, 140, 240, 255]);
+        let flat = center(Adjust { saturation: -100.0, ..Adjust::NEUTRAL }, &orange);
+        let spread = flat.iter().max().unwrap() - flat.iter().min().unwrap();
+        assert!(spread <= 3, "saturation -100: {flat:?}");
+        let more = center(Adjust { contrast: 100.0, ..Adjust::NEUTRAL }, &paint(160, 90, |_, _| [200, 200, 200, 255]));
+        assert!(more[1] > 205, "contrast +100 brightens light gray: {more:?}");
+        // With REC_EVIDENCE_DIR: the test card through each setting.
+        let card = letterboxed_cam();
+        let mut tracker = crate::bars::Tracker::default();
+        let bars = (0..60).map(|i| tracker.frame(i as f64 / 30.0, &card)).last().unwrap();
+        for (name, a) in [
+            ("adjust-neutral", Adjust::NEUTRAL),
+            ("adjust-3200k", Adjust { temperature: 3200.0, ..Adjust::NEUTRAL }),
+            ("adjust-8000k", Adjust { temperature: 8000.0, ..Adjust::NEUTRAL }),
+            ("adjust-osmo-studio-5000k", crate::settings::CameraLook::default().osmo_studio(5000.0).adjust),
+            ("adjust-exposure-plus-1", Adjust { exposure: 1.0, ..Adjust::NEUTRAL }),
+            ("adjust-saturation-minus-100", Adjust { saturation: -100.0, ..Adjust::NEUTRAL }),
+            ("adjust-sharpness-minus-2", Adjust { sharpness: -2.0, ..Adjust::NEUTRAL }),
+        ] {
+            let out = paint(640, 360, |_, _| [0, 0, 0, 255]);
+            let mut c = Compositor::new(640, 360, PipSpec { mirror: false, ..Default::default() });
+            c.set_adjust(&a);
+            c.render(Scene::Cam, None, Some((&card, bars)), &out);
+            save_png(&out, name);
+        }
+    }
+
+    /// Softening blurs edges and sharpening steepens them, without
+    /// darkening the picture's border (the blur is clamped to the picture).
+    #[test]
+    fn sharpness_both_ways() {
+        use crate::look::Adjust;
+        // 1:1, at 720p, so the blur isn't hidden by scaling.
+        let (w, h) = (1280, 720);
+        // Vertical black and white bars 8 px wide.
+        let bars_cam = paint(w, h, |x, _| if (x / 8) % 2 == 0 { [30, 30, 30, 255] } else { [220, 220, 220, 255] });
+        let row = |a: Adjust| {
+            let out = paint(w, h, |_, _| [0, 0, 0, 255]);
+            let mut c = Compositor::new(w, h, PipSpec { mirror: false, ..Default::default() });
+            c.set_adjust(&a);
+            c.render(Scene::Cam, None, Some((&bars_cam, Bars::NONE)), &out);
+            (0..w).map(|x| pixel(&out, x, h / 2)[1] as i32).collect::<Vec<i32>>()
+        };
+        // Sum of steps between neighbors: higher is crisper.
+        let edges = |r: &[i32]| r.windows(2).map(|p| (p[1] - p[0]).abs()).max().unwrap();
+        let (plain, soft, sharp) =
+            (row(Adjust::NEUTRAL), row(Adjust { sharpness: -2.0, ..Adjust::NEUTRAL }), row(Adjust { sharpness: 2.0, ..Adjust::NEUTRAL }));
+        assert!(edges(&soft) < edges(&plain), "soft {} vs {}", edges(&soft), edges(&plain));
+        // Sharpening overshoots: darker darks or brighter brights near edges.
+        let range = |r: &[i32]| r.iter().max().unwrap() - r.iter().min().unwrap();
+        assert!(range(&sharp) > range(&plain), "sharp {} vs {}", range(&sharp), range(&plain));
+        // The picture's edge columns keep their value when softened.
+        assert!(
+            (soft[0] - plain[0]).abs() <= 12 && (soft[w - 1] - plain[w - 1]).abs() <= 40,
+            "{} {} / {} {}",
+            soft[0],
+            plain[0],
+            soft[w - 1],
+            plain[w - 1]
+        );
+        let denoised = row(Adjust { noise_reduction: 2.0, ..Adjust::NEUTRAL });
+        assert!((denoised[w / 2] - plain[w / 2]).abs() <= 40, "noise reduction keeps flat areas");
+    }
+
+    /// Zebras and the grid are preview guides. A camera look with both on
+    /// gives the compositor (which draws the frame the file, the stream
+    /// and the preview all get) only its adjustments, and the frame comes
+    /// out byte for byte as with them off; and the recording path's code
+    /// doesn't know the guides exist.
+    #[test]
+    fn preview_guides_never_reach_the_recording() {
+        use crate::settings::CameraLook;
+        let guides = CameraLook::default().osmo_studio(5600.0);
+        assert!(guides.zebras && guides.grid);
+        let plain = CameraLook { zebras: false, grid: false, ..guides.clone() };
+        // A blown-out camera: zebras would stripe all of it.
+        let cam = paint(320, 180, |_, _| [255, 255, 255, 255]);
+        let screen = paint(640, 360, |_, _| [250, 250, 250, 255]);
+        for scene in [Scene::Cam, Scene::ScreenCam] {
+            let render = |look: &CameraLook| {
+                let out = paint(640, 360, |_, _| [0, 255, 0, 255]);
+                let mut c = Compositor::new(640, 360, PipSpec::default());
+                c.set_adjust(&look.adjust);
+                c.render(scene, Some(&screen), Some((&cam, Bars::NONE)), &out);
+                bytes(&out)
+            };
+            let with = render(&guides);
+            assert!(with == render(&plain), "{scene:?}: the guides change nothing");
+            if scene == Scene::Cam {
+                assert!(with.chunks(4).all(|p| p[..3].iter().all(|&v| v >= 250)), "no stripes: the frame stays white");
+            }
+        }
+        // The code that draws recorded and streamed frames.
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files: Vec<std::path::PathBuf> =
+            ["compose.rs", "writer.rs", "record.rs", "look.rs", "scale.rs", "bars.rs", "camera.rs"].iter().map(|f| dir.join(f)).collect();
+        files.extend(std::fs::read_dir(dir.join("live")).unwrap().map(|e| e.unwrap().path()));
+        for f in files {
+            let text = std::fs::read_to_string(&f).unwrap();
+            // Up to its tests (this test names the guides).
+            let code = text.split("#[cfg(test)]").next().unwrap().to_lowercase();
+            for word in ["zebra", "cameralook", ".grid", "set_zebras", "thirds("] {
+                assert!(!code.contains(word), "{} mentions {word:?}", f.display());
+            }
+        }
+    }
+
+    /// What the camera adjustments cost the compositor at 1080p (run with
+    /// --ignored --nocapture, in release): wall time per frame for 240
+    /// frames, neutral against the Osmo studio preset and everything on.
+    #[test]
+    #[ignore]
+    fn adjustment_cost() {
+        use crate::look::Adjust;
+        fn cpu() -> f64 {
+            let mut u: libc::rusage = unsafe { std::mem::zeroed() };
+            unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut u) };
+            let tv = |t: libc::timeval| t.tv_sec as f64 + t.tv_usec as f64 / 1e6;
+            tv(u.ru_utime) + tv(u.ru_stime)
+        }
+        let (w, h) = (1920, 1080);
+        let screen = paint(w, h, |x, y| [(x % 256) as u8, (y % 256) as u8, 128, 255]);
+        let cam = busy_cam(1920, 1080);
+        let everything = Adjust {
+            temperature: 5000.0,
+            tint: 5.0,
+            exposure: 0.3,
+            brightness: 5.0,
+            contrast: 10.0,
+            saturation: -10.0,
+            sharpness: 1.0,
+            noise_reduction: 1.0,
+        };
+        let cases = [
+            ("neutral", Adjust::NEUTRAL),
+            ("Osmo studio 5600K (soften)", Adjust { sharpness: -1.0, ..Adjust::NEUTRAL }),
+            ("color only (WB, EV, contrast, saturation)", Adjust { sharpness: 0.0, noise_reduction: 0.0, ..everything }),
+            ("everything (with sharpen and denoise)", everything),
+        ];
+        let pool = make_pool(w, h, PIX_BGRA);
+        for scene in [Scene::Cam, Scene::ScreenCam] {
+            for (name, a) in &cases {
+                let mut c = Compositor::new(w, h, PipSpec::default());
+                c.set_adjust(a);
+                let frame = |c: &mut Compositor| {
+                    let mut b = std::ptr::null_mut();
+                    unsafe { objc2_core_video::CVPixelBufferPool::create_pixel_buffer(None, &pool, std::ptr::NonNull::from(&mut b)) };
+                    let b: CFRetained<CVPixelBuffer> = unsafe { CFRetained::from_raw(std::ptr::NonNull::new(b).unwrap()) };
+                    objc2::rc::autoreleasepool(|_| c.render(scene, Some(&screen), Some((&cam, Bars::NONE)), &b));
+                };
+                for _ in 0..20 {
+                    frame(&mut c);
+                }
+                let n = 240;
+                let (t, c0) = (std::time::Instant::now(), cpu());
+                for _ in 0..n {
+                    frame(&mut c);
+                }
+                let ms = t.elapsed().as_secs_f64() * 1000.0 / n as f64;
+                let cpu_ms = (cpu() - c0) * 1000.0 / n as f64;
+                println!("{scene:?} 1080p, 1080p camera, {name}: {ms:.2} ms/frame wall, {cpu_ms:.2} ms CPU");
+            }
+        }
     }
 
     /// What an Osmo Pocket 3 sends on a portrait format: a 720x1280 frame

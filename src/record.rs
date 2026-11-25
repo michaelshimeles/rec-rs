@@ -89,6 +89,11 @@ pub struct Options {
     /// Set when the requested mic isn't connected and the default is used.
     pub mic_warning: Option<String>,
     pub webcam: Option<Option<String>>,
+    /// The camera picture size to ask for.
+    pub cam_resolution: camera::CamResolution,
+    /// Software adjustments to the camera picture (`look`), in the preview
+    /// and the recording alike; `Session::set_cam_adjust` changes them live.
+    pub cam_adjust: crate::look::Adjust,
     pub pip: PipSpec,
     pub cursor: bool,
     pub clicks: bool,
@@ -211,7 +216,11 @@ impl Session {
         let window = matches!(target, Some(screen::Target::Window(_)));
         let pixel_format = if o.webcam.is_some() || window { PIX_BGRA } else { PIX_420V };
         let spec = VideoSpec { width: w, height: h, fps: o.fps, codec: o.codec, bitrate: o.bitrate, pixel_format };
-        let compositor = o.webcam.as_ref().map(|_| Compositor::new(w, h, o.pip.clone()));
+        let compositor = o.webcam.as_ref().map(|_| {
+            let mut c = Compositor::new(w, h, o.pip.clone());
+            c.set_adjust(&o.cam_adjust);
+            c
+        });
         let path = write.then_some(o.output.as_path());
         let mut sink = Sink::new(path, &spec, o.system_audio, o.mic.is_some(), o.audio_layout, o.volumes, compositor, o.scene, preview)?;
         if capture_size(o) != (w, h)
@@ -304,13 +313,20 @@ impl Session {
         let (w, h) = o.size;
         let mut cam = cam;
         if let Some(sel) = &o.webcam {
-            let reuse = cam.take_if(|c| Camera::resolve(sel.as_deref()).is_ok_and(|id| id == c.id));
+            // The same camera at the same size keeps running; anything else
+            // is stopped first, so the camera can switch formats.
+            let reuse = cam.take_if(|c| c.resolution == o.cam_resolution && Camera::resolve(sel.as_deref()).is_ok_and(|id| id == c.id));
+            if reuse.is_none()
+                && let Some(c) = cam.take()
+            {
+                c.stop();
+            }
             let c = match reuse {
                 Some(c) => {
                     c.retarget(self.shared.clone());
                     c
                 }
-                None => Camera::start(sel.as_deref(), self.shared.clone())?,
+                None => Camera::start(sel.as_deref(), o.cam_resolution, self.shared.clone())?,
             };
             // Start the file once the camera shows a picture and has had
             // time to settle its exposure, so it doesn't open on black or
@@ -380,6 +396,11 @@ impl Session {
         self.cam.as_ref().map(|c| c.name.as_str())
     }
 
+    /// The running camera's (unique ID, name).
+    pub fn camera(&self) -> Option<(&str, &str)> {
+        self.cam.as_ref().map(|c| (c.id.as_str(), c.name.as_str()))
+    }
+
     /// True once a source or the writer failed (see `error`).
     pub fn failed(&self) -> bool {
         self.stop.load(Ordering::SeqCst)
@@ -423,6 +444,12 @@ impl Session {
     /// Move or restyle the camera overlay live; also applies to the file.
     pub fn set_pip(&self, pip: PipSpec) {
         self.shared.with(|s| s.set_pip(pip));
+    }
+
+    /// Change the camera's software adjustments live; also applies to the
+    /// file and the live encode.
+    pub fn set_cam_adjust(&self, adjust: &crate::look::Adjust) {
+        self.shared.with(|s| s.set_cam_adjust(adjust));
     }
 
     /// Move the audio faders [system, mic] live: every track of the file
