@@ -832,7 +832,8 @@ fn camera_adjustments(ui: &mut Ui, st: &State, s: &mut Settings) {
 
     // Hardware controls the camera answers for.
     let mut hw_sets: Vec<(Control, i32)> = vec![];
-    if running && (hw.probing || !hw.controls.is_empty()) {
+    // An error (the camera couldn't be opened) shows here too.
+    if running && (hw.probing || !hw.controls.is_empty() || hw.error.is_some()) {
         w::divider(ui);
         w::subhead(ui, "Lens", Some(("Camera", false, "Set on the camera itself over USB")));
         if hw.probing {

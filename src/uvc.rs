@@ -575,12 +575,23 @@ fn sent(state: &Mutex<Snapshot>, changed: &impl Fn(), results: &[(Control, Resul
 
 /// Read every control's current value once the camera has settled (it may
 /// also move by itself: autofocus moves the focus position) and publish.
+/// The reads happen without the snapshot's lock: each can take up to its
+/// timeout, and the UI reads the snapshot every frame.
 fn read_back<R: Requests>(cam: &Camera<R>, state: &Mutex<Snapshot>, changed: &impl Fn()) {
+    let (camera, controls) = {
+        let s = state.lock().unwrap();
+        (s.camera.clone(), s.controls.iter().map(|c| c.control).collect::<Vec<_>>())
+    };
+    let values: Vec<(Control, i32)> = controls.into_iter().filter_map(|c| cam.read(c, GET_CUR).ok().map(|v| (c, v))).collect();
     {
         let mut s = state.lock().unwrap();
-        for c in &mut s.controls {
-            if let Ok(v) = cam.read(c.control, GET_CUR) {
-                c.range.cur = v.clamp(c.range.min, c.range.max);
+        // Another camera was attached meanwhile.
+        if s.camera != camera {
+            return;
+        }
+        for (c, v) in values {
+            if let Some(cs) = s.controls.iter_mut().find(|cs| cs.control == c) {
+                cs.range.cur = v.clamp(cs.range.min, cs.range.max);
             }
         }
     }
@@ -830,12 +841,18 @@ pub fn cli(sel: Option<&str>, sets: &[String], dump: bool) -> anyhow::Result<()>
     }
     for d in picked {
         let Some(id) = usb_id(&d.id) else {
+            if !sets.is_empty() {
+                anyhow::bail!("{}: not a USB camera, no hardware controls to set", d.name);
+            }
             println!("{}: not a USB camera, no hardware controls", d.name);
             continue;
         };
         println!("{} ({}): USB {:04x}:{:04x} at {:#010x}", d.name, d.id, id.vendor, id.product, id.location);
         let cam = match IoUsbDevice::open(&d.id) {
             Ok(c) => c,
+            // Listing goes on to the next camera; a change that can't be
+            // made is an error.
+            Err(e) if !sets.is_empty() => anyhow::bail!("{}: {e}", d.name),
             Err(e) => {
                 println!("  {e}");
                 continue;
@@ -1213,6 +1230,51 @@ mod tests {
         let s = wait_for(&|s| s.get(Control::Focus).is_some_and(|c| c.range.cur == 1500));
         assert_eq!(s.get(Control::Focus).unwrap().range.cur, 1500);
         assert_eq!(s.get(Control::FocusAuto).unwrap().range.cur, 1);
+        hw.finish();
+    }
+
+    /// A camera whose every read takes 200 ms (a stalling USB device):
+    /// while the worker reads it back, the UI's snapshot never waits.
+    #[test]
+    fn slow_reads_never_block_the_ui() {
+        struct Sluggish(FakeOsmo, Arc<std::sync::atomic::AtomicBool>);
+        impl Requests for Sluggish {
+            fn get(&self, r: u8, u: u8, s: u8, l: usize) -> Result<Vec<u8>, i32> {
+                if r == GET_CUR && self.1.load(std::sync::atomic::Ordering::SeqCst) {
+                    std::thread::sleep(Duration::from_millis(200));
+                }
+                self.0.get(r, u, s, l)
+            }
+            fn set(&self, u: u8, s: u8, d: &[u8]) -> Result<(), i32> {
+                self.0.set(u, s, d)
+            }
+        }
+        let slow = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = slow.clone();
+        let hw = Hardware::with_opener(
+            || {},
+            move |_: &str| Ok(Camera { dev: Sluggish(FakeOsmo::new(), flag.clone()), vc: parse_config(OSMO).unwrap() }),
+            Duration::from_millis(10),
+        );
+        hw.attach("0x1000002ca30023", &BTreeMap::new());
+        let t = Instant::now();
+        while hw.snapshot().probing && t.elapsed() < Duration::from_secs(3) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        slow.store(true, std::sync::atomic::Ordering::SeqCst);
+        hw.set(Control::Zoom, 150);
+        // The read-back starts after 10 ms and takes 4 x 200 ms.
+        std::thread::sleep(Duration::from_millis(60));
+        let mut worst = Duration::ZERO;
+        let t = Instant::now();
+        while t.elapsed() < Duration::from_millis(600) {
+            let s = Instant::now();
+            let snap = hw.snapshot();
+            worst = worst.max(s.elapsed());
+            assert_eq!(snap.get(Control::Zoom).unwrap().range.cur, 150);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(worst < Duration::from_millis(50), "the UI waited {worst:?} for the snapshot");
         hw.finish();
     }
 
